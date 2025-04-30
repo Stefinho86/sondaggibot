@@ -73,8 +73,11 @@ def get_city_for_chat(chat_id):
     row = cur.fetchone()
     return row[0] if row and row[0] else None
 
+# --- La funzione decisiva per APScheduler + PTB polling ---
 def run_async_job(app, coro_func, *args, **kwargs):
-    app.create_task(coro_func(*args, **kwargs))
+    import asyncio
+    fut = asyncio.run_coroutine_threadsafe(coro_func(*args, **kwargs), app.loop)
+    return fut
 
 def parse_italian_datetime(input_str, tz_str):
     try:
@@ -310,7 +313,7 @@ async def modifica_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _start_modifica2(update, context, poll_id)
 
 async def modifica_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+    chat_id = update.message.chat.id
     text = update.message.text.strip()
     if text.isdigit():
         poll_id = int(text)
