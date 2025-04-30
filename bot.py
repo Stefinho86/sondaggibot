@@ -37,20 +37,19 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
-
 logger = logging.getLogger(__name__)
 
 # Funzione per pubblicare il sondaggio
 async def pubblica_sondaggio(chat_id, question, options, application, poll_id, recurrence):
     try:
-        logger.info(f"Tentativo invio sondaggio a chat_id {chat_id} | Domanda: {question} | Opzioni: {options}")
+        logger.info(f"Tentativo invio sondaggio a chat_id={chat_id} | Domanda: {question} | Opzioni: {options}")
         await application.bot.send_poll(
             chat_id=chat_id,
             question=question,
             options=options,
             is_anonymous=False
         )
-        logger.info(f"Sondaggio pubblicato per chat_id {chat_id} con successo!")
+        logger.info(f"Sondaggio pubblicato per chat_id={chat_id} con successo!")
         # Rischedula se ricorrente
         if recurrence == "giornaliera":
             next_time = datetime.now() + timedelta(days=1)
@@ -79,8 +78,11 @@ async def pubblica_sondaggio(chat_id, question, options, application, poll_id, r
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Ciao! Usa /nuovosondaggio per programmare un sondaggio, anche ricorrente.\n"
-        "Ricorda: il bot deve essere amministratore del gruppo e avere il permesso di inviare sondaggi!"
+        "Il bot deve essere amministratore del gruppo e avere il permesso di inviare sondaggi!"
     )
+
+async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"chat_id: {update.message.chat_id}")
 
 async def nuovosondaggio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Scrivi la domanda del sondaggio.")
@@ -121,7 +123,7 @@ async def ricevi_ricorrenza(update: Update, context: ContextTypes.DEFAULT_TYPE):
     question = context.user_data['question']
     options = context.user_data['options']
     dt = context.user_data['dt']
-    logger.info(f"Prenoto sondaggio per chat_id={chat_id} ({question}) alle {dt} con ricorrenza {recurrence}")
+    application = context.application
     # Salva nel DB
     cur.execute(
         "INSERT INTO polls (chat_id, question, options, schedule_time, recurrence) VALUES (?, ?, ?, ?, ?)",
@@ -129,12 +131,14 @@ async def ricevi_ricorrenza(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     conn.commit()
     poll_id = cur.lastrowid
-    application = context.application
+    # Schedula la pubblicazione
     scheduler.add_job(
         partial(pubblica_sondaggio, chat_id, question, options, application, poll_id, recurrence),
         'date',
         run_date=datetime.strptime(dt, "%Y-%m-%d %H:%M")
     )
+    # LOG IMMEDIATO DELLA SCHEDULAZIONE
+    logger.info(f"Sondaggio schedulato per chat_id={chat_id} | Domanda: {question} | Opzioni: {options} | Data: {dt} | Ricorrenza: {recurrence}")
     await update.message.reply_text(
         f"Sondaggio programmato per il {dt} con ricorrenza: {recurrence}.\n"
         f"ATTENZIONE: il bot deve essere amministratore del gruppo e con permesso 'Inviare sondaggi'!"
@@ -156,6 +160,7 @@ def carica_sondaggi_precedenti(application):
                 'date',
                 run_date=dt
             )
+            logger.info(f"Sondaggio ripristinato in scheduler per chat_id={chat_id} | Domanda: {question} | Data: {schedule_time} | Ricorrenza: {recurrence}")
 
 if __name__ == "__main__":
     if not TOKEN:
@@ -176,6 +181,7 @@ if __name__ == "__main__":
     )
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("debug", debug))   # <-- nuovo comando debug
     application.add_handler(conv_handler)
 
     carica_sondaggi_precedenti(application)
