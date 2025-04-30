@@ -10,7 +10,8 @@ import requests
 from timezonefinder import TimezoneFinder
 
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand,
+    KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
 )
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, ConversationHandler, CallbackQueryHandler,
@@ -20,12 +21,10 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-# Conversazione states
 SELECT_CITY, Q, OPTS, DT, REC, REC_DETAIL = range(6)
 MOD_SELECT, MOD_Q, MOD_O, MOD_D, MOD_R, MOD_RD = range(10, 16)
 CANCEL_SELECT, MODIFY_SELECT = range(20, 22)
 
-# DB setup
 conn = sqlite3.connect('sondaggi.db', check_same_thread=False)
 cur = conn.cursor()
 cur.execute('''CREATE TABLE IF NOT EXISTS polls (
@@ -48,8 +47,6 @@ scheduler = BackgroundScheduler()
 scheduler.start()
 logging.basicConfig(level=logging.INFO)
 tf = TimezoneFinder()
-
-# ==== UTILS ====
 
 def get_timezone_for_city(city):
     try:
@@ -136,39 +133,64 @@ def remove_job_by_poll_id(poll_id):
                 job.remove()
                 break
 
-# ==== HANDLERS ====
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     tz = get_timezone_for_chat(chat_id)
     if not tz:
-        await update.message.reply_text(
-            "In che città vuoi usare il bot? (esempio: Milano)"
-        )
+        await cambia_citta(update, context)
         return SELECT_CITY
     city = get_city_for_chat(chat_id)
     await update.message.reply_text(
-        f"Bot pronto per {city}.\nComandi:\n/nuovosondaggio\n/sondaggi\n/cancella\n/modifica\n/ora\n/debug"
+        f"Bot pronto per {city}.\nComandi:\n/nuovosondaggio\n/sondaggi\n/cancella\n/modifica\n/cambia_citta\n/ora\n/debug"
     )
+
+async def cambia_citta(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = [[KeyboardButton("📍 Invia posizione", request_location=True)]]
+    await update.message.reply_text(
+        "In che città vuoi impostare il bot?\n"
+        "Puoi scrivere il nome (es: Milano) oppure inviare la tua posizione premendo qui sotto:",
+        reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True, resize_keyboard=True)
+    )
+    return SELECT_CITY
 
 async def set_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    city = update.message.text.strip()
-    timezone_str, coords = get_timezone_for_city(city)
-    if not timezone_str:
-        await update.message.reply_text("Città non trovata! Riprova.")
-        return SELECT_CITY
-    save_chat_timezone(chat_id, city.title(), timezone_str)
-    await update.message.reply_text(
-        f"Città impostata: {city.title()} ({timezone_str}). Ora puoi usare /nuovosondaggio!"
-    )
-    return ConversationHandler.END
+    if update.message.location:
+        lat = update.message.location.latitude
+        lon = update.message.location.longitude
+        tz = tf.timezone_at(lat=lat, lng=lon)
+        if not tz:
+            await update.message.reply_text("Non sono riuscito a rilevare il fuso orario. Riprova o inserisci il nome della città.", reply_markup=ReplyKeyboardRemove())
+            return SELECT_CITY
+        try:
+            nominatim_url = f"https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat={lat}&lon={lon}"
+            r = requests.get(nominatim_url, headers={"User-Agent": "TelegramPollBot/1.0"})
+            data = r.json()
+            city = data.get('address', {}).get('city') or data.get('address', {}).get('town') or data.get('address', {}).get('village') or "Località non nota"
+        except Exception:
+            city = "Località non nota"
+        save_chat_timezone(chat_id, city, tz)
+        await update.message.reply_text(
+            f"Impostato: {city} ({tz})", reply_markup=ReplyKeyboardRemove()
+        )
+        return ConversationHandler.END
+    else:
+        city = update.message.text.strip()
+        timezone_str, coords = get_timezone_for_city(city)
+        if not timezone_str:
+            await update.message.reply_text("Città non trovata! Riprova.", reply_markup=ReplyKeyboardRemove())
+            return SELECT_CITY
+        save_chat_timezone(chat_id, city.title(), timezone_str)
+        await update.message.reply_text(
+            f"Città impostata: {city.title()} ({timezone_str}).", reply_markup=ReplyKeyboardRemove()
+        )
+        return ConversationHandler.END
 
 async def ora_attuale(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     tz_str = get_timezone_for_chat(chat_id)
     if not tz_str:
-        await update.message.reply_text("Prima imposta la città con /start")
+        await update.message.reply_text("Prima imposta la città con /start o /cambia_citta")
         return
     utc_now = datetime.utcnow()
     tz = pytz.timezone(tz_str)
@@ -186,8 +208,6 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"chat_id: {chat_id}\nCittà: {city or 'Non impostata'}\nTimezone: {tz or 'Non impostato'}"
     )
-
-# --- Sondaggi elenco, cancellazione, modifica ---
 
 async def lista_sondaggi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -299,13 +319,11 @@ async def _start_modifica(update_or_query, context, poll_id):
     )
     return MOD_SELECT
 
-# --- Nuovo sondaggio ---
-
 async def nuovosondaggio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     tz = get_timezone_for_chat(chat_id)
     if not tz:
-        await update.message.reply_text("Prima imposta la città con /start")
+        await update.message.reply_text("Prima imposta la città con /start o /cambia_citta")
         return ConversationHandler.END
     await update.message.reply_text("Scrivi la domanda del sondaggio.")
     return Q
@@ -387,14 +405,12 @@ async def schedula_sondaggio(update: Update, context: ContextTypes.DEFAULT_TYPE)
     recurrence = context.user_data.get('recurrence', "nessuna")
     recurrence_detail = context.user_data.get('recurrence_detail', "")
     application = context.application
-
     cur.execute(
         "INSERT INTO polls (chat_id, question, options, schedule_time, recurrence, recurrence_detail) VALUES (?, ?, ?, ?, ?, ?)",
         (chat_id, question, ",".join(options), dt, recurrence, recurrence_detail)
     )
     conn.commit()
     poll_id = cur.lastrowid
-
     scheduler.add_job(
         run_async_job,
         'date',
@@ -408,7 +424,7 @@ async def schedula_sondaggio(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 async def annulla(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Operazione annullata.")
+    await update.message.reply_text("Operazione annullata.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
 async def pubblica_sondaggio(chat_id, question, options, application, poll_id, recurrence, recurrence_detail):
@@ -472,8 +488,6 @@ def carica_sondaggi_precedenti(application):
                 run_date=dt,
                 args=(pubblica_sondaggio(chat_id, question, options.split(','), application, poll_id, recurrence, recurrence_detail),)
             )
-
-# --- MODIFICA SONDAGGI (dialogo) ---
 
 async def mod_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text.strip().lower()
@@ -575,8 +589,6 @@ async def mod_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 if __name__ == "__main__":
     application = ApplicationBuilder().token(TOKEN).build()
-
-    # Barra comandi Telegram
     async def set_my_commands(app):
         commands = [
             BotCommand("start", "Avvia o cambia città"),
@@ -584,6 +596,7 @@ if __name__ == "__main__":
             BotCommand("sondaggi", "Sondaggi programmati"),
             BotCommand("cancella", "Cancella un sondaggio"),
             BotCommand("modifica", "Modifica un sondaggio"),
+            BotCommand("cambia_citta", "Cambia la città/fuso orario"),
             BotCommand("ora", "Orario locale"),
             BotCommand("debug", "Info chat"),
         ]
@@ -618,9 +631,12 @@ if __name__ == "__main__":
     )
 
     city_conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('start', start)],
+        entry_points=[
+            CommandHandler('start', start),
+            CommandHandler('cambia_citta', cambia_citta)
+        ],
         states={
-            SELECT_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_city)],
+            SELECT_CITY: [MessageHandler(filters.ALL, set_city)],
         },
         fallbacks=[CommandHandler('annulla', annulla)],
     )
