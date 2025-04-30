@@ -89,6 +89,19 @@ def get_city_for_chat(chat_id):
     else:
         return None
 
+# --- APSCHEDULER PATCH: RUN ASYNC JOBS ---
+def run_async_job(coro):
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    if loop.is_running():
+        asyncio.ensure_future(coro)
+    else:
+        loop.run_until_complete(coro)
+
 # --- HANDLERS ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -233,9 +246,10 @@ async def ricevi_ricorrenza(update: Update, context: ContextTypes.DEFAULT_TYPE):
     poll_id = cur.lastrowid
 
     scheduler.add_job(
-        partial(pubblica_sondaggio, chat_id, question, options, application, poll_id, recurrence),
+        run_async_job,
         'date',
-        run_date=datetime.strptime(dt, "%Y-%m-%d %H:%M")
+        run_date=datetime.strptime(dt, "%Y-%m-%d %H:%M"),
+        args=(pubblica_sondaggio(chat_id, question, options, application, poll_id, recurrence),)
     )
     city = get_city_for_chat(chat_id)
     await update.message.reply_text(
@@ -276,9 +290,10 @@ async def pubblica_sondaggio(chat_id, question, options, application, poll_id, r
             )
             conn.commit()
             scheduler.add_job(
-                partial(pubblica_sondaggio, chat_id, question, options, application, poll_id, recurrence),
+                run_async_job,
                 'date',
-                run_date=next_time
+                run_date=next_time,
+                args=(pubblica_sondaggio(chat_id, question, options, application, poll_id, recurrence),)
             )
         else:
             cur.execute("DELETE FROM polls WHERE id = ?", (poll_id,))
@@ -295,9 +310,10 @@ def carica_sondaggi_precedenti(application):
         dt = datetime.strptime(schedule_time, "%Y-%m-%d %H:%M")
         if dt > datetime.utcnow():
             scheduler.add_job(
-                partial(pubblica_sondaggio, chat_id, question, options.split(','), application, poll_id, recurrence),
+                run_async_job,
                 'date',
-                run_date=dt
+                run_date=dt,
+                args=(pubblica_sondaggio(chat_id, question, options.split(','), application, poll_id, recurrence),)
             )
             print(f"--- RIPRISTINATO sondaggio per chat_id={chat_id} | Domanda: {question} | Data: {schedule_time} | Ricorrenza: {recurrence}", flush=True)
             logger.info(f"Sondaggio ripristinato per chat_id={chat_id} | Domanda: {question} | Data: {schedule_time} | Ricorrenza: {recurrence}")
