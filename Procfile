@@ -1,1 +1,1 @@
-start: python sondaggibot.py
+start: python bot.py
