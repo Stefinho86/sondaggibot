@@ -54,7 +54,6 @@ tf = TimezoneFinder()
 # --- UTILS ---
 
 def get_timezone_for_city(city_name):
-    # Usa OpenStreetMap Nominatim per trovare lat/lon della città
     try:
         url = f"https://nominatim.openstreetmap.org/search?city={city_name}&format=json"
         response = requests.get(url, headers={"User-Agent": "TelegramPollBot/1.0"})
@@ -253,8 +252,8 @@ async def annulla(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def pubblica_sondaggio(chat_id, question, options, application, poll_id, recurrence):
+    print(f"--- PUBBLICAZIONE: provo a inviare sondaggio a chat_id={chat_id} alle {datetime.utcnow()}", flush=True)
     try:
-        print(f"--- SONO DENTRO pubblica_sondaggio per chat_id={chat_id} a {datetime.utcnow()}", flush=True)
         logger.info(f"Tentativo invio sondaggio a chat_id={chat_id} | Domanda: {question} | Opzioni: {options}")
         await application.bot.send_poll(
             chat_id=chat_id,
@@ -304,7 +303,7 @@ def carica_sondaggi_precedenti(application):
             logger.info(f"Sondaggio ripristinato per chat_id={chat_id} | Domanda: {question} | Data: {schedule_time} | Ricorrenza: {recurrence}")
 
 if __name__ == "__main__":
-    print("Sto avviando il BOT! Versione città/fuso orario auto!", flush=True)
+    print("Sto avviando il BOT! Versione città/fuso orario auto con log pubblicazione!", flush=True)
 
     if not TOKEN:
         print("Errore: TOKEN non impostato. Devi configurare la variabile d'ambiente TELEGRAM_BOT_TOKEN.", flush=True)
