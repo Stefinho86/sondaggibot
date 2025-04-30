@@ -74,11 +74,11 @@ def get_city_for_chat(chat_id):
 
 def run_async_job(coro):
     import asyncio
-    loop = asyncio.get_event_loop()
-    if loop.is_running():
-        asyncio.ensure_future(coro)
-    else:
-        loop.run_until_complete(coro)
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(coro)
+    except RuntimeError:
+        asyncio.run(coro)
 
 def parse_italian_datetime(input_str, tz_str):
     try:
@@ -217,9 +217,9 @@ async def ora_attuale(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not tz_str:
         await update.message.reply_text("Prima imposta la città con /start o /cambia_citta")
         return
-    utc_now = datetime.utcnow()
+    utc_now = datetime.now(pytz.utc)
     tz = pytz.timezone(tz_str)
-    local_now = pytz.utc.localize(utc_now).astimezone(tz)
+    local_now = utc_now.astimezone(tz)
     city = get_city_for_chat(chat_id)
     await update.message.reply_text(
         f"Ora locale {city} ({tz_str}): {local_now.strftime('%d/%m/%Y %H.%M')}\n"
@@ -289,7 +289,6 @@ async def cancella_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Sondaggio cancellato.")
         else:
             await update.message.reply_text("ID non trovato.")
-    # Non bloccare altri comandi
     return
 
 async def modifica_sondaggio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -382,7 +381,7 @@ async def ricevi_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not utc_dt:
         await update.message.reply_text("Formato data/ora non valido. Riprova (es: 30/04/2025 16.30)")
         return DT
-    if utc_dt < datetime.utcnow().replace(tzinfo=pytz.utc):
+    if utc_dt < datetime.now(pytz.utc):
         await update.message.reply_text("La data è nel passato. Riprova.")
         return DT
     context.user_data['dt'] = utc_dt.strftime("%Y-%m-%d %H:%M")
@@ -420,7 +419,6 @@ async def ricevi_recurrence_detail(update: Update, context: ContextTypes.DEFAULT
     context.user_data['recurrence'] = kind
     context.user_data['recurrence_detail'] = detail
     if kind == "intervallo":
-        # Ricorrenza a intervallo: la prima pubblicazione è dt, poi ogni X minuti/ore/secondi
         pass
     else:
         context.user_data['dt'] = interval_or_next.strftime("%Y-%m-%d %H:%M")
@@ -442,7 +440,6 @@ async def schedula_sondaggio(update: Update, context: ContextTypes.DEFAULT_TYPE)
     conn.commit()
     poll_id = cur.lastrowid
     if recurrence == "intervallo":
-        # Ricorrenza intervallo: usa scheduler.add_job con trigger=interval, start_date=dt
         _, value, unit = recurrence_detail.split("|")
         value = int(value)
         if unit == "minuti":
@@ -488,7 +485,6 @@ async def pubblica_sondaggio(chat_id, question, options, application, poll_id, r
             is_anonymous=False
         )
         if recurrence == "intervallo":
-            # Non serve rischedulare, lo fa apscheduler
             pass
         else:
             next_time = None
@@ -497,7 +493,7 @@ async def pubblica_sondaggio(chat_id, question, options, application, poll_id, r
                 hour, minute = map(int, hourmin.split("."))
                 tz_str = get_timezone_for_chat(chat_id)
                 tz = pytz.timezone(tz_str)
-                now_local = datetime.utcnow().astimezone(tz)
+                now_local = datetime.now(pytz.utc).astimezone(tz)
                 candidate = now_local + timedelta(days=1)
                 candidate = candidate.replace(hour=hour, minute=minute, second=0, microsecond=0)
                 next_time = candidate.astimezone(pytz.utc)
@@ -507,7 +503,7 @@ async def pubblica_sondaggio(chat_id, question, options, application, poll_id, r
                 hour, minute = map(int, hourmin.split("."))
                 tz_str = get_timezone_for_chat(chat_id)
                 tz = pytz.timezone(tz_str)
-                now_local = datetime.utcnow().astimezone(tz)
+                now_local = datetime.now(pytz.utc).astimezone(tz)
                 days_ahead = (wd - now_local.weekday() + 7) % 7
                 candidate = now_local + timedelta(days=days_ahead)
                 candidate = candidate.replace(hour=hour, minute=minute, second=0, microsecond=0)
@@ -557,7 +553,7 @@ def carica_sondaggi_precedenti(application):
                 args=(pubblica_sondaggio(chat_id, question, options.split(','), application, poll_id, recurrence, recurrence_detail),),
                 **trigger_args
             )
-        elif dt > datetime.utcnow():
+        elif dt > datetime.now(pytz.utc):
             scheduler.add_job(
                 run_async_job,
                 'date',
