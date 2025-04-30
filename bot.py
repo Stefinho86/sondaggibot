@@ -137,25 +137,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     tz = get_timezone_for_chat(chat_id)
     if not tz:
-        await cambia_citta(update, context)
-        return SELECT_CITY
+        if update.effective_chat.type == "private":
+            await cambia_citta(update, context)
+            return SELECT_CITY
+        else:
+            await update.message.reply_text(
+                "Imposta la città per questo gruppo: scrivi il nome della città (esempio: Milano)."
+            )
+            return SELECT_CITY
     city = get_city_for_chat(chat_id)
     await update.message.reply_text(
         f"Bot pronto per {city}.\nComandi:\n/nuovosondaggio\n/sondaggi\n/cancella\n/modifica\n/cambia_citta\n/ora\n/debug"
     )
 
 async def cambia_citta(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [[KeyboardButton("📍 Invia posizione", request_location=True)]]
-    await update.message.reply_text(
-        "In che città vuoi impostare il bot?\n"
-        "Puoi scrivere il nome (es: Milano) oppure inviare la tua posizione premendo qui sotto:",
-        reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True, resize_keyboard=True)
-    )
+    if update.effective_chat.type == "private":
+        kb = [[KeyboardButton("📍 Invia posizione", request_location=True)]]
+        await update.message.reply_text(
+            "In che città vuoi impostare il bot?\n"
+            "Puoi scrivere il nome (es: Milano) oppure inviare la tua posizione premendo qui sotto:",
+            reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True, resize_keyboard=True)
+        )
+    else:
+        await update.message.reply_text(
+            "In che città vuoi impostare il bot per questo gruppo? Scrivi il nome della città (esempio: Milano)."
+        )
     return SELECT_CITY
 
 async def set_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    if update.message.location:
+    if update.message.location and update.effective_chat.type == "private":
         lat = update.message.location.latitude
         lon = update.message.location.longitude
         tz = tf.timezone_at(lat=lat, lng=lon)
