@@ -1,3 +1,5 @@
+import os
+TOKEN = os.getenv("7430014492:AAEh-fyDDfmsIs3ArNFYQCEKY26aD_ROHDg")
 import logging
 from telegram import Update
 from telegram.ext import (
