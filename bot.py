@@ -1,30 +1,31 @@
 import os
-import logging
-import sys
 import sqlite3
 from datetime import datetime, timedelta
-from functools import partial
+import logging
+import re
 import traceback
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, ConversationHandler,
-    MessageHandler, CallbackQueryHandler, ContextTypes, filters
-)
 import pytz
-from apscheduler.schedulers.background import BackgroundScheduler
-from timezonefinder import TimezoneFinder
 import requests
-import re
+from timezonefinder import TimezoneFinder
+
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+)
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, ConversationHandler, CallbackQueryHandler,
+    MessageHandler, ContextTypes, filters
+)
+from apscheduler.schedulers.background import BackgroundScheduler
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-# Conversation states
-SELECT_CITY, QUESTION, OPTIONS, DATETIME, ASK_RECURRENCE, RECURRENCE_DETAIL = range(6)
-MOD_SELECT, MOD_QUESTION, MOD_OPTIONS, MOD_DATETIME, MOD_REC, MOD_REC_DETAIL = range(10, 16)
-AWAITING_CANCEL_SELECT, AWAITING_MODIFY_SELECT = range(20, 22)
+# Conversazione states
+SELECT_CITY, Q, OPTS, DT, REC, REC_DETAIL = range(6)
+MOD_SELECT, MOD_Q, MOD_O, MOD_D, MOD_R, MOD_RD = range(10, 16)
+CANCEL_SELECT, MODIFY_SELECT = range(20, 22)
 
-# DB Setup
+# DB setup
 conn = sqlite3.connect('sondaggi.db', check_same_thread=False)
 cur = conn.cursor()
 cur.execute('''CREATE TABLE IF NOT EXISTS polls (
@@ -45,61 +46,39 @@ conn.commit()
 
 scheduler = BackgroundScheduler()
 scheduler.start()
-
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
-logger = logging.getLogger(__name__)
-
+logging.basicConfig(level=logging.INFO)
 tf = TimezoneFinder()
 
-# --- UTILS ---
+# ==== UTILS ====
 
-def get_timezone_for_city(city_name):
+def get_timezone_for_city(city):
     try:
-        url = f"https://nominatim.openstreetmap.org/search?city={city_name}&format=json"
-        response = requests.get(url, headers={"User-Agent": "TelegramPollBot/1.0"})
-        results = response.json()
-        if not results:
-            return None, None
-        lat = float(results[0]['lat'])
-        lon = float(results[0]['lon'])
-        timezone_str = tf.timezone_at(lat=lat, lng=lon)
-        return timezone_str, (lat, lon)
-    except Exception as e:
-        logger.error(f"Errore nel recuperare la timezone per la città {city_name}: {e}")
-        return None, None
+        url = f"https://nominatim.openstreetmap.org/search?city={city}&format=json"
+        r = requests.get(url, headers={"User-Agent": "TelegramPollBot/1.0"})
+        res = r.json()
+        if not res: return None, None
+        lat, lon = float(res[0]['lat']), float(res[0]['lon'])
+        tz = tf.timezone_at(lat=lat, lng=lon)
+        return tz, (lat, lon)
+    except: return None, None
 
 def get_timezone_for_chat(chat_id):
     cur.execute("SELECT timezone FROM chat_settings WHERE chat_id = ?", (chat_id,))
     row = cur.fetchone()
-    if row and row[0]:
-        return row[0]
-    else:
-        return None
+    return row[0] if row and row[0] else None
 
 def save_chat_timezone(chat_id, city, timezone):
-    cur.execute("INSERT OR REPLACE INTO chat_settings (chat_id, city, timezone) VALUES (?, ?, ?)",
-        (chat_id, city, timezone))
+    cur.execute("INSERT OR REPLACE INTO chat_settings (chat_id, city, timezone) VALUES (?, ?, ?)", (chat_id, city, timezone))
     conn.commit()
 
 def get_city_for_chat(chat_id):
     cur.execute("SELECT city FROM chat_settings WHERE chat_id = ?", (chat_id,))
     row = cur.fetchone()
-    if row and row[0]:
-        return row[0]
-    else:
-        return None
+    return row[0] if row and row[0] else None
 
 def run_async_job(coro):
     import asyncio
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    loop = asyncio.get_event_loop()
     if loop.is_running():
         asyncio.ensure_future(coro)
     else:
@@ -112,8 +91,7 @@ def parse_italian_datetime(input_str, tz_str):
         local_dt = tz.localize(dt)
         utc_dt = local_dt.astimezone(pytz.utc)
         return utc_dt, local_dt
-    except Exception as e:
-        return None, None
+    except: return None, None
 
 def parse_recurrence_detail(input_str, tz_str, first_dt_utc):
     input_str = input_str.lower().strip()
@@ -158,49 +136,33 @@ def remove_job_by_poll_id(poll_id):
                 job.remove()
                 break
 
-# --- HANDLERS ---
+# ==== HANDLERS ====
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     tz = get_timezone_for_chat(chat_id)
     if not tz:
         await update.message.reply_text(
-            "In che città vuoi usare il bot? (scrivi solo il nome della città, esempio: Milano)"
+            "In che città vuoi usare il bot? (esempio: Milano)"
         )
         return SELECT_CITY
-    else:
-        city = get_city_for_chat(chat_id)
-        await update.message.reply_text(
-            f"Bot pronto per {city}.\n"
-            "Comandi:\n"
-            "/nuovosondaggio\n/sondaggi\n/cancella\n/modifica\n/debug\n/ora"
-        )
+    city = get_city_for_chat(chat_id)
+    await update.message.reply_text(
+        f"Bot pronto per {city}.\nComandi:\n/nuovosondaggio\n/sondaggi\n/cancella\n/modifica\n/ora\n/debug"
+    )
 
 async def set_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     city = update.message.text.strip()
     timezone_str, coords = get_timezone_for_city(city)
     if not timezone_str:
-        await update.message.reply_text(
-            "Città non trovata! Riprova (esempio: Roma, Napoli, Palermo, New York, London)"
-        )
+        await update.message.reply_text("Città non trovata! Riprova.")
         return SELECT_CITY
     save_chat_timezone(chat_id, city.title(), timezone_str)
     await update.message.reply_text(
-        f"Impostata città: {city.title()} (fuso orario: {timezone_str})\n"
-        "Ora puoi usare /nuovosondaggio!"
+        f"Città impostata: {city.title()} ({timezone_str}). Ora puoi usare /nuovosondaggio!"
     )
     return ConversationHandler.END
-
-async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    tz = get_timezone_for_chat(chat_id)
-    city = get_city_for_chat(chat_id)
-    await update.message.reply_text(
-        f"chat_id: {chat_id}\n"
-        f"Città: {city or 'Non impostata'}\n"
-        f"Timezone: {tz or 'Non impostato'}"
-    )
 
 async def ora_attuale(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -216,6 +178,16 @@ async def ora_attuale(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Ora locale {city} ({tz_str}): {local_now.strftime('%d/%m/%Y %H.%M')}\n"
         f"Ora UTC: {utc_now.strftime('%d/%m/%Y %H.%M')}"
     )
+
+async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    tz = get_timezone_for_chat(chat_id)
+    city = get_city_for_chat(chat_id)
+    await update.message.reply_text(
+        f"chat_id: {chat_id}\nCittà: {city or 'Non impostata'}\nTimezone: {tz or 'Non impostato'}"
+    )
+
+# --- Sondaggi elenco, cancellazione, modifica ---
 
 async def lista_sondaggi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -239,17 +211,13 @@ async def cancella_sondaggio(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not rows:
         await update.message.reply_text("Non ci sono sondaggi da cancellare.")
         return ConversationHandler.END
-
     if not context.args:
-        # Mostra lista con bottoni
         keyboard = [
             [InlineKeyboardButton(f"{i+1}. {row[1]}", callback_data=f"cancel_{row[0]}")]
             for i, row in enumerate(rows)
         ]
         await update.message.reply_text("Seleziona il sondaggio da cancellare:", reply_markup=InlineKeyboardMarkup(keyboard))
-        return AWAITING_CANCEL_SELECT
-
-    # se l'utente passa un numero (1, 2, 3) invece che l'id vero
+        return CANCEL_SELECT
     arg = context.args[0]
     if arg.isdigit():
         idx = int(arg) - 1
@@ -261,11 +229,10 @@ async def cancella_sondaggio(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         await update.message.reply_text("Usa: /cancella <numero sondaggio>")
         return ConversationHandler.END
-
     await _do_cancel_poll(update, poll_id)
     return ConversationHandler.END
 
-async def _do_cancel_poll(update: Update, poll_id: int):
+async def _do_cancel_poll(update, poll_id):
     cur.execute("DELETE FROM polls WHERE id=?", (poll_id,))
     conn.commit()
     remove_job_by_poll_id(poll_id)
@@ -275,8 +242,7 @@ async def cancella_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-    if not data.startswith("cancel_"):
-        return
+    if not data.startswith("cancel_"): return
     poll_id = int(data.split("_")[1])
     await _do_cancel_poll(query, poll_id)
 
@@ -287,16 +253,13 @@ async def modifica_sondaggio(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not rows:
         await update.message.reply_text("Non ci sono sondaggi da modificare.")
         return ConversationHandler.END
-
     if not context.args:
-        # Mostra lista con bottoni
         keyboard = [
             [InlineKeyboardButton(f"{i+1}. {row[1]}", callback_data=f"modify_{row[0]}")]
             for i, row in enumerate(rows)
         ]
         await update.message.reply_text("Seleziona il sondaggio da modificare:", reply_markup=InlineKeyboardMarkup(keyboard))
-        return AWAITING_MODIFY_SELECT
-
+        return MODIFY_SELECT
     arg = context.args[0]
     if arg.isdigit():
         idx = int(arg) - 1
@@ -308,15 +271,13 @@ async def modifica_sondaggio(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         await update.message.reply_text("Usa: /modifica <numero sondaggio>")
         return ConversationHandler.END
-
     return await _start_modifica(update, context, poll_id)
 
 async def modifica_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-    if not data.startswith("modify_"):
-        return
+    if not data.startswith("modify_"): return
     poll_id = int(data.split("_")[1])
     return await _start_modifica(query, context, poll_id)
 
@@ -334,68 +295,58 @@ async def _start_modifica(update_or_query, context, poll_id):
     context.user_data['recurrence'] = recurrence
     context.user_data['recurrence_detail'] = rec_detail
     await update_or_query.message.reply_text(
-        f"Modifica sondaggio. Che cosa vuoi modificare?\n"
-        "Rispondi: domanda, opzioni, data, ricorrenza, niente"
+        f"Cosa vuoi modificare?\nRispondi: domanda, opzioni, data, ricorrenza, niente"
     )
     return MOD_SELECT
+
+# --- Nuovo sondaggio ---
 
 async def nuovosondaggio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     tz = get_timezone_for_chat(chat_id)
     if not tz:
-        await update.message.reply_text(
-            "Prima imposta la città con /start"
-        )
+        await update.message.reply_text("Prima imposta la città con /start")
         return ConversationHandler.END
     await update.message.reply_text("Scrivi la domanda del sondaggio.")
-    return QUESTION
+    return Q
 
 async def ricevi_domanda(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['question'] = update.message.text
     await update.message.reply_text("Ora scrivi le opzioni separate da virgola (esempio: Sì,No,Forse)")
-    return OPTIONS
+    return OPTS
 
 async def ricevi_opzioni(update: Update, context: ContextTypes.DEFAULT_TYPE):
     options = [opt.strip() for opt in update.message.text.split(',')]
     if len(options) < 2:
         await update.message.reply_text("Servono almeno due opzioni!")
-        return OPTIONS
+        return OPTS
     if len(options) > 10:
-        await update.message.reply_text("Telegram permette massimo 10 opzioni. Riprova.")
-        return OPTIONS
+        await update.message.reply_text("Max 10 opzioni. Riprova.")
+        return OPTS
     context.user_data['options'] = options
     chat_id = update.effective_chat.id
     city = get_city_for_chat(chat_id)
     await update.message.reply_text(
-        f"Quando vuoi pubblicare il sondaggio?\n"
-        f"(Formato: GG/MM/AAAA HH.MM, orario LOCALE di {city})"
+        f"Quando vuoi pubblicare il sondaggio?\n(Formato: GG/MM/AAAA HH.MM, orario di {city})"
     )
-    return DATETIME
+    return DT
 
 async def ricevi_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     tz_str = get_timezone_for_chat(chat_id)
-    if not tz_str:
-        await update.message.reply_text("Prima imposta la città con /start")
-        return ConversationHandler.END
     utc_dt, local_dt = parse_italian_datetime(update.message.text, tz_str)
     if not utc_dt:
-        await update.message.reply_text(
-            "Formato data/ora non valido. Riprova (esempio: 30/04/2025 16.30)"
-        )
-        return DATETIME
+        await update.message.reply_text("Formato data/ora non valido. Riprova (es: 30/04/2025 16.30)")
+        return DT
     if utc_dt < datetime.utcnow().replace(tzinfo=pytz.utc):
         await update.message.reply_text("La data è nel passato. Riprova.")
-        return DATETIME
+        return DT
     context.user_data['dt'] = utc_dt.strftime("%Y-%m-%d %H:%M")
     context.user_data['local_dt'] = local_dt.strftime("%d/%m/%Y %H.%M")
     await update.message.reply_text(
-        "Vuoi che il sondaggio sia pubblicato ricorrentemente?\n"
-        "Scrivi:\n"
-        "- no (pubblica solo una volta)\n"
-        "- si (richiederà dettagli dopo)"
+        "Vuoi che il sondaggio sia ricorrente?\nScrivi:\n- no (solo una volta)\n- si"
     )
-    return ASK_RECURRENCE
+    return REC
 
 async def ricevi_ask_ricorrenza(update: Update, context: ContextTypes.DEFAULT_TYPE):
     risposta = update.message.text.strip().lower()
@@ -405,15 +356,11 @@ async def ricevi_ask_ricorrenza(update: Update, context: ContextTypes.DEFAULT_TY
         return await schedula_sondaggio(update, context)
     elif risposta == "si":
         await update.message.reply_text(
-            "Ogni quanto deve essere pubblicato il sondaggio?\n"
-            "Esempi:\n"
-            "- ogni giorno alle 18.30\n"
-            "- ogni martedì alle 10.00"
+            "Ogni quanto?\nEsempi:\n- ogni giorno alle 18.30\n- ogni martedì alle 10.00"
         )
-        return RECURRENCE_DETAIL
-    else:
-        await update.message.reply_text("Rispondi: no oppure si.")
-        return ASK_RECURRENCE
+        return REC_DETAIL
+    await update.message.reply_text("Rispondi: no oppure si.")
+    return REC
 
 async def ricevi_recurrence_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -423,11 +370,9 @@ async def ricevi_recurrence_detail(update: Update, context: ContextTypes.DEFAULT
     kind, next_run_utc, detail = parse_recurrence_detail(update.message.text, tz_str, first_dt_utc)
     if not kind or not next_run_utc:
         await update.message.reply_text(
-            "Non riesco a capire la ricorrenza. Esempi validi:\n"
-            "- ogni giorno alle 18.30\n"
-            "- ogni martedì alle 10.00"
+            "Non capisco la ricorrenza. Esempi:\n- ogni giorno alle 18.30\n- ogni martedì alle 10.00"
         )
-        return RECURRENCE_DETAIL
+        return REC_DETAIL
     context.user_data['recurrence'] = kind
     context.user_data['recurrence_detail'] = detail
     context.user_data['dt'] = next_run_utc.strftime("%Y-%m-%d %H:%M")
@@ -458,11 +403,8 @@ async def schedula_sondaggio(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
     city = get_city_for_chat(chat_id)
     await update.message.reply_text(
-        f"Sondaggio programmato per il {local_dt} ({city}) "
-        f"(UTC: {dt}) con ricorrenza: {recurrence if recurrence != 'nessuna' else 'nessuna'}.\n"
-        f"ATTENZIONE: il bot deve essere amministratore del gruppo e poter inviare sondaggi!"
+        f"Sondaggio programmato per il {local_dt} ({city})\nRicorrenza: {recurrence if recurrence != 'nessuna' else 'nessuna'}"
     )
-    logger.info(f"Sondaggio schedulato per chat_id={chat_id} | Domanda: {question} | Opzioni: {options} | Data: {dt} | Ricorrenza: {recurrence} | Dettaglio: {recurrence_detail}")
     return ConversationHandler.END
 
 async def annulla(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -516,7 +458,6 @@ async def pubblica_sondaggio(chat_id, question, options, application, poll_id, r
             cur.execute("DELETE FROM polls WHERE id = ?", (poll_id,))
             conn.commit()
     except Exception as e:
-        logger.error(f"Errore nell'inviare sondaggio a chat_id={chat_id}: {e}")
         traceback.print_exc()
 
 def carica_sondaggi_precedenti(application):
@@ -532,22 +473,22 @@ def carica_sondaggi_precedenti(application):
                 args=(pubblica_sondaggio(chat_id, question, options.split(','), application, poll_id, recurrence, recurrence_detail),)
             )
 
-# --- MODIFICA SONDAGGI ---
+# --- MODIFICA SONDAGGI (dialogo) ---
 
 async def mod_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text.strip().lower()
     if txt == "domanda":
         await update.message.reply_text("Scrivi la nuova domanda.")
-        return MOD_QUESTION
+        return MOD_Q
     elif txt == "opzioni":
         await update.message.reply_text("Scrivi le nuove opzioni separate da virgola.")
-        return MOD_OPTIONS
+        return MOD_O
     elif txt == "data":
         await update.message.reply_text("Nuova data? (GG/MM/AAAA HH.MM)")
-        return MOD_DATETIME
+        return MOD_D
     elif txt == "ricorrenza":
         await update.message.reply_text("Vuoi che sia ricorrente? (si/no)")
-        return MOD_REC
+        return MOD_R
     elif txt == "niente":
         await update.message.reply_text("Modifica annullata.")
         return ConversationHandler.END
@@ -557,16 +498,16 @@ async def mod_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def mod_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['question'] = update.message.text
-    await update.message.reply_text("OK, domanda aggiornata. Vuoi modificare altro? (domanda, opzioni, data, ricorrenza, niente)")
+    await update.message.reply_text("Domanda aggiornata. Altra modifica? (domanda, opzioni, data, ricorrenza, niente)")
     return MOD_SELECT
 
 async def mod_options(update: Update, context: ContextTypes.DEFAULT_TYPE):
     options = [opt.strip() for opt in update.message.text.split(',')]
     if len(options) < 2 or len(options) > 10:
         await update.message.reply_text("Numero opzioni non valido!")
-        return MOD_OPTIONS
+        return MOD_O
     context.user_data['options'] = options
-    await update.message.reply_text("OK, opzioni aggiornate. Vuoi modificare altro? (domanda, opzioni, data, ricorrenza, niente)")
+    await update.message.reply_text("Opzioni aggiornate. Altra modifica? (domanda, opzioni, data, ricorrenza, niente)")
     return MOD_SELECT
 
 async def mod_datetime(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -575,9 +516,9 @@ async def mod_datetime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     utc_dt, local_dt = parse_italian_datetime(update.message.text, tz_str)
     if not utc_dt:
         await update.message.reply_text("Formato data/ora non valido. (GG/MM/AAAA HH.MM)")
-        return MOD_DATETIME
+        return MOD_D
     context.user_data['dt'] = utc_dt.strftime("%Y-%m-%d %H:%M")
-    await update.message.reply_text("OK, data aggiornata. Vuoi modificare altro? (domanda, opzioni, data, ricorrenza, niente)")
+    await update.message.reply_text("Data aggiornata. Altra modifica? (domanda, opzioni, data, ricorrenza, niente)")
     return MOD_SELECT
 
 async def mod_rec(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -585,14 +526,14 @@ async def mod_rec(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if txt == "no":
         context.user_data['recurrence'] = "nessuna"
         context.user_data['recurrence_detail'] = ""
-        await update.message.reply_text("OK, ricorrenza rimossa. Vuoi modificare altro? (domanda, opzioni, data, ricorrenza, niente)")
+        await update.message.reply_text("Ricorrenza rimossa. Altra modifica? (domanda, opzioni, data, ricorrenza, niente)")
         return MOD_SELECT
     elif txt == "si":
         await update.message.reply_text("Ogni quanto? (es: ogni giorno alle 18.30, ogni martedì alle 10.00)")
-        return MOD_REC_DETAIL
+        return MOD_RD
     else:
         await update.message.reply_text("Rispondi si oppure no.")
-        return MOD_REC
+        return MOD_R
 
 async def mod_rec_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -601,12 +542,12 @@ async def mod_rec_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     first_dt_utc = datetime.strptime(dt, "%Y-%m-%d %H:%M").replace(tzinfo=pytz.utc)
     kind, next_run_utc, detail = parse_recurrence_detail(update.message.text, tz_str, first_dt_utc)
     if not kind or not next_run_utc:
-        await update.message.reply_text("Non riesco a capire la ricorrenza.")
-        return MOD_REC_DETAIL
+        await update.message.reply_text("Non capisco la ricorrenza.")
+        return MOD_RD
     context.user_data['recurrence'] = kind
     context.user_data['recurrence_detail'] = detail
     context.user_data['dt'] = next_run_utc.strftime("%Y-%m-%d %H:%M")
-    await update.message.reply_text("OK, ricorrenza aggiornata. Vuoi modificare altro? (domanda, opzioni, data, ricorrenza, niente)")
+    await update.message.reply_text("Ricorrenza aggiornata. Altra modifica? (domanda, opzioni, data, ricorrenza, niente)")
     return MOD_SELECT
 
 async def mod_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -633,39 +574,32 @@ async def mod_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 if __name__ == "__main__":
-    print("Avvio bot...")
-
-    if not TOKEN:
-        print("Errore: TOKEN non impostato. Devi configurare la variabile d'ambiente TELEGRAM_BOT_TOKEN.", flush=True)
-        exit(1)
-
     application = ApplicationBuilder().token(TOKEN).build()
 
-    # Imposta i comandi nella barra Telegram
-    commands = [
-        BotCommand("start", "Avvia il bot o cambia città"),
-        BotCommand("nuovosondaggio", "Crea un nuovo sondaggio"),
-        BotCommand("sondaggi", "Elenca sondaggi programmati"),
-        BotCommand("cancella", "Cancella un sondaggio"),
-        BotCommand("modifica", "Modifica un sondaggio"),
-        BotCommand("ora", "Ora locale della città"),
-        BotCommand("debug", "Info sulla chat"),
-    ]
+    # Barra comandi Telegram
     async def set_my_commands(app):
+        commands = [
+            BotCommand("start", "Avvia o cambia città"),
+            BotCommand("nuovosondaggio", "Crea un nuovo sondaggio"),
+            BotCommand("sondaggi", "Sondaggi programmati"),
+            BotCommand("cancella", "Cancella un sondaggio"),
+            BotCommand("modifica", "Modifica un sondaggio"),
+            BotCommand("ora", "Orario locale"),
+            BotCommand("debug", "Info chat"),
+        ]
         await app.bot.set_my_commands(commands)
     application.post_init = set_my_commands
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('nuovosondaggio', nuovosondaggio)],
         states={
-            SELECT_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_city)],
-            QUESTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_domanda)],
-            OPTIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_opzioni)],
-            DATETIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_data)],
-            ASK_RECURRENCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_ask_ricorrenza)],
-            RECURRENCE_DETAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_recurrence_detail)],
-            AWAITING_CANCEL_SELECT: [CallbackQueryHandler(cancella_callback, pattern="^cancel_")],
-            AWAITING_MODIFY_SELECT: [CallbackQueryHandler(modifica_callback, pattern="^modify_")],
+            Q: [MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_domanda)],
+            OPTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_opzioni)],
+            DT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_data)],
+            REC: [MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_ask_ricorrenza)],
+            REC_DETAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_recurrence_detail)],
+            CANCEL_SELECT: [CallbackQueryHandler(cancella_callback, pattern="^cancel_")],
+            MODIFY_SELECT: [CallbackQueryHandler(modifica_callback, pattern="^modify_")],
         },
         fallbacks=[CommandHandler('annulla', annulla)],
     )
@@ -674,11 +608,11 @@ if __name__ == "__main__":
         entry_points=[CommandHandler('modifica', modifica_sondaggio)],
         states={
             MOD_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, mod_select)],
-            MOD_QUESTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, mod_question)],
-            MOD_OPTIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, mod_options)],
-            MOD_DATETIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, mod_datetime)],
-            MOD_REC: [MessageHandler(filters.TEXT & ~filters.COMMAND, mod_rec)],
-            MOD_REC_DETAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, mod_rec_detail)],
+            MOD_Q: [MessageHandler(filters.TEXT & ~filters.COMMAND, mod_question)],
+            MOD_O: [MessageHandler(filters.TEXT & ~filters.COMMAND, mod_options)],
+            MOD_D: [MessageHandler(filters.TEXT & ~filters.COMMAND, mod_datetime)],
+            MOD_R: [MessageHandler(filters.TEXT & ~filters.COMMAND, mod_rec)],
+            MOD_RD: [MessageHandler(filters.TEXT & ~filters.COMMAND, mod_rec_detail)],
         },
         fallbacks=[MessageHandler(filters.TEXT & ~filters.COMMAND, mod_end)],
     )
@@ -700,6 +634,4 @@ if __name__ == "__main__":
     application.add_handler(mod_conv)
 
     carica_sondaggi_precedenti(application)
-
-    print("Bot in esecuzione... Premi CTRL+C per fermarlo.", flush=True)
     application.run_polling()
