@@ -48,14 +48,17 @@ logger = logging.getLogger(__name__)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Ciao! Questo bot crea sondaggi programmati. "
+        "Ciao! Questo bot crea sondaggi programmati.\n"
         "Usa /nuovosondaggio per iniziare.\n"
-        "Comando di debug: /debug"
+        "Comandi utili: /debug /ora"
     )
 
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await update.message.reply_text(f"chat_id: {chat_id}")
+
+async def ora_attuale(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Ora UTC secondo il bot: " + datetime.utcnow().strftime("%Y-%m-%d %H:%M"))
 
 async def nuovosondaggio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Scrivi la domanda del sondaggio.")
@@ -71,20 +74,35 @@ async def ricevi_opzioni(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(options) < 2:
         await update.message.reply_text("Servono almeno due opzioni!")
         return OPTIONS
+    if len(options) > 10:
+        await update.message.reply_text("Telegram permette massimo 10 opzioni. Riprova.")
+        return OPTIONS
     context.user_data['options'] = options
-    await update.message.reply_text("Quando vuoi pubblicare il sondaggio? (formato: YYYY-MM-DD HH:MM, esempio: 2025-04-30 16:00)")
+    await update.message.reply_text(
+        "Quando vuoi pubblicare il sondaggio?\n"
+        "(Formato: YYYY-MM-DD HH:MM, orario UTC. Scrivi /ora per sapere l'ora UTC attuale)"
+    )
     return DATETIME
 
 async def ricevi_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         dt = datetime.strptime(update.message.text, "%Y-%m-%d %H:%M")
+        if dt < datetime.utcnow():
+            await update.message.reply_text("La data è nel passato. Riprova.")
+            return DATETIME
         context.user_data['dt'] = dt.strftime("%Y-%m-%d %H:%M")
         await update.message.reply_text(
-            "Vuoi che il sondaggio sia:\n- Senza ricorrenza\n- Giornaliera\n- Settimanale\n\nScrivi: nessuna, giornaliera, settimanale"
+            "Vuoi che il sondaggio sia:\n"
+            "- Senza ricorrenza\n"
+            "- Giornaliera\n"
+            "- Settimanale\n"
+            "Scrivi: nessuna, giornaliera, settimanale"
         )
         return RECURRENCE
     except Exception:
-        await update.message.reply_text("Formato data/ora non valido. Riprova (esempio: 2025-04-30 16:00)")
+        await update.message.reply_text(
+            "Formato data/ora non valido. Riprova (esempio: 2025-04-30 16:00)"
+        )
         return DATETIME
 
 async def ricevi_ricorrenza(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -117,8 +135,8 @@ async def ricevi_ricorrenza(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Sondaggio schedulato per chat_id={chat_id} | Domanda: {question} | Opzioni: {options} | Data: {dt} | Ricorrenza: {recurrence}")
 
     await update.message.reply_text(
-        f"Sondaggio programmato per il {dt} con ricorrenza: {recurrence}.\n"
-        f"ATTENZIONE: il bot deve essere amministratore del gruppo e con permesso 'Inviare sondaggi'!"
+        f"Sondaggio programmato per il {dt} UTC con ricorrenza: {recurrence}.\n"
+        f"ATTENZIONE: il bot deve essere amministratore del gruppo e poter inviare sondaggi!"
     )
     return ConversationHandler.END
 
@@ -130,7 +148,7 @@ async def annulla(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def pubblica_sondaggio(chat_id, question, options, application, poll_id, recurrence):
     try:
-        print(f"--- SONO DENTRO pubblica_sondaggio per chat_id={chat_id} a {datetime.now()}", flush=True)
+        print(f"--- SONO DENTRO pubblica_sondaggio per chat_id={chat_id} a {datetime.utcnow()}", flush=True)
         logger.info(f"Tentativo invio sondaggio a chat_id={chat_id} | Domanda: {question} | Opzioni: {options}")
         await application.bot.send_poll(
             chat_id=chat_id,
@@ -138,13 +156,13 @@ async def pubblica_sondaggio(chat_id, question, options, application, poll_id, r
             options=options,
             is_anonymous=False
         )
-        print(f"--- INVIATO sondaggio per chat_id={chat_id} a {datetime.now()}", flush=True)
+        print(f"--- INVIATO sondaggio per chat_id={chat_id} a {datetime.utcnow()}", flush=True)
         logger.info(f"Sondaggio pubblicato per chat_id={chat_id} con successo!")
         # Ricorrenza
         if recurrence == "giornaliera":
-            next_time = datetime.now() + timedelta(days=1)
+            next_time = datetime.utcnow() + timedelta(days=1)
         elif recurrence == "settimanale":
-            next_time = datetime.now() + timedelta(weeks=1)
+            next_time = datetime.utcnow() + timedelta(weeks=1)
         else:
             next_time = None
         if next_time:
@@ -173,7 +191,7 @@ def carica_sondaggi_precedenti(application):
     for poll in cur.fetchall():
         poll_id, chat_id, question, options, schedule_time, recurrence = poll
         dt = datetime.strptime(schedule_time, "%Y-%m-%d %H:%M")
-        if dt > datetime.now():
+        if dt > datetime.utcnow():
             scheduler.add_job(
                 partial(pubblica_sondaggio, chat_id, question, options.split(','), application, poll_id, recurrence),
                 'date',
@@ -185,7 +203,7 @@ def carica_sondaggi_precedenti(application):
 # --- MAIN ---
 
 if __name__ == "__main__":
-    print("Sto avviando il BOT! Versione aggiornata con /debug!", flush=True)
+    print("Sto avviando il BOT! Versione aggiornata con /debug e /ora!", flush=True)
 
     if not TOKEN:
         print("Errore: TOKEN non impostato. Devi configurare la variabile d'ambiente TELEGRAM_BOT_TOKEN.", flush=True)
@@ -206,6 +224,7 @@ if __name__ == "__main__":
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("debug", debug))
+    application.add_handler(CommandHandler("ora", ora_attuale))
     application.add_handler(conv_handler)
 
     carica_sondaggi_precedenti(application)
