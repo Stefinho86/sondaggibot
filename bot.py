@@ -1,23 +1,25 @@
 import os
 import logging
-import traceback
+import sys
 import sqlite3
+from datetime import datetime, timedelta
+from functools import partial
+import traceback
+
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, ConversationHandler,
     MessageHandler, ContextTypes, filters
 )
 from apscheduler.schedulers.background import BackgroundScheduler
-from datetime import datetime, timedelta
-from functools import partial
 
-# Leggi il token dalla variabile d'ambiente!
+# ENV
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-# Stati della conversazione
+# Conversation states
 QUESTION, OPTIONS, DATETIME, RECURRENCE = range(4)
 
-# DB setup
+# DB Setup
 conn = sqlite3.connect('sondaggi.db', check_same_thread=False)
 cur = conn.cursor()
 cur.execute('''CREATE TABLE IF NOT EXISTS polls (
@@ -30,18 +32,105 @@ cur.execute('''CREATE TABLE IF NOT EXISTS polls (
 )''')
 conn.commit()
 
+# Scheduler
 scheduler = BackgroundScheduler()
 scheduler.start()
 
+# Logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
+logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
 logger = logging.getLogger(__name__)
 
-# Funzione per pubblicare il sondaggio
+# --- HANDLERS ---
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Ciao! Questo bot crea sondaggi programmati. "
+        "Usa /nuovosondaggio per iniziare.\n"
+        "Comando di debug: /debug"
+    )
+
+async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(f"chat_id: {chat_id}")
+
+async def nuovosondaggio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Scrivi la domanda del sondaggio.")
+    return QUESTION
+
+async def ricevi_domanda(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['question'] = update.message.text
+    await update.message.reply_text("Ora scrivi le opzioni separate da virgola (esempio: Sì,No,Forse)")
+    return OPTIONS
+
+async def ricevi_opzioni(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    options = [opt.strip() for opt in update.message.text.split(',')]
+    if len(options) < 2:
+        await update.message.reply_text("Servono almeno due opzioni!")
+        return OPTIONS
+    context.user_data['options'] = options
+    await update.message.reply_text("Quando vuoi pubblicare il sondaggio? (formato: YYYY-MM-DD HH:MM, esempio: 2025-04-30 16:00)")
+    return DATETIME
+
+async def ricevi_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        dt = datetime.strptime(update.message.text, "%Y-%m-%d %H:%M")
+        context.user_data['dt'] = dt.strftime("%Y-%m-%d %H:%M")
+        await update.message.reply_text(
+            "Vuoi che il sondaggio sia:\n- Senza ricorrenza\n- Giornaliera\n- Settimanale\n\nScrivi: nessuna, giornaliera, settimanale"
+        )
+        return RECURRENCE
+    except Exception:
+        await update.message.reply_text("Formato data/ora non valido. Riprova (esempio: 2025-04-30 16:00)")
+        return DATETIME
+
+async def ricevi_ricorrenza(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    recurrence = update.message.text.strip().lower()
+    if recurrence not in ["nessuna", "giornaliera", "settimanale"]:
+        await update.message.reply_text("Rispondi: nessuna, giornaliera, o settimanale.")
+        return RECURRENCE
+
+    chat_id = update.effective_chat.id
+    question = context.user_data['question']
+    options = context.user_data['options']
+    dt = context.user_data['dt']
+    application = context.application
+
+    # Salva nel DB
+    cur.execute(
+        "INSERT INTO polls (chat_id, question, options, schedule_time, recurrence) VALUES (?, ?, ?, ?, ?)",
+        (chat_id, question, ",".join(options), dt, recurrence)
+    )
+    conn.commit()
+    poll_id = cur.lastrowid
+
+    # Schedula la pubblicazione
+    scheduler.add_job(
+        partial(pubblica_sondaggio, chat_id, question, options, application, poll_id, recurrence),
+        'date',
+        run_date=datetime.strptime(dt, "%Y-%m-%d %H:%M")
+    )
+    print(f"--- SCHEDULATO sondaggio per chat_id={chat_id} | Domanda: {question} | Opzioni: {options} | Data: {dt} | Ricorrenza: {recurrence}", flush=True)
+    logger.info(f"Sondaggio schedulato per chat_id={chat_id} | Domanda: {question} | Opzioni: {options} | Data: {dt} | Ricorrenza: {recurrence}")
+
+    await update.message.reply_text(
+        f"Sondaggio programmato per il {dt} con ricorrenza: {recurrence}.\n"
+        f"ATTENZIONE: il bot deve essere amministratore del gruppo e con permesso 'Inviare sondaggi'!"
+    )
+    return ConversationHandler.END
+
+async def annulla(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Operazione annullata.")
+    return ConversationHandler.END
+
+# --- PUBBLICAZIONE SONDAGGIO ---
+
 async def pubblica_sondaggio(chat_id, question, options, application, poll_id, recurrence):
     try:
+        print(f"--- SONO DENTRO pubblica_sondaggio per chat_id={chat_id} a {datetime.now()}", flush=True)
         logger.info(f"Tentativo invio sondaggio a chat_id={chat_id} | Domanda: {question} | Opzioni: {options}")
         await application.bot.send_poll(
             chat_id=chat_id,
@@ -49,8 +138,9 @@ async def pubblica_sondaggio(chat_id, question, options, application, poll_id, r
             options=options,
             is_anonymous=False
         )
+        print(f"--- INVIATO sondaggio per chat_id={chat_id} a {datetime.now()}", flush=True)
         logger.info(f"Sondaggio pubblicato per chat_id={chat_id} con successo!")
-        # Rischedula se ricorrente
+        # Ricorrenza
         if recurrence == "giornaliera":
             next_time = datetime.now() + timedelta(days=1)
         elif recurrence == "settimanale":
@@ -72,82 +162,11 @@ async def pubblica_sondaggio(chat_id, question, options, application, poll_id, r
             cur.execute("DELETE FROM polls WHERE id = ?", (poll_id,))
             conn.commit()
     except Exception as e:
+        print(f"--- ERRORE invio sondaggio: {e}", flush=True)
         logger.error(f"Errore nell'inviare sondaggio a chat_id={chat_id}: {e}")
         traceback.print_exc()
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Ciao! Usa /nuovosondaggio per programmare un sondaggio, anche ricorrente.\n"
-        "Il bot deve essere amministratore del gruppo e avere il permesso di inviare sondaggi!"
-    )
-
-async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"chat_id: {update.message.chat_id}")
-
-async def nuovosondaggio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Scrivi la domanda del sondaggio.")
-    return QUESTION
-
-async def ricevi_domanda(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['question'] = update.message.text
-    await update.message.reply_text("Ora scrivi le opzioni separate da virgola (esempio: Sì,No,Forse)")
-    return OPTIONS
-
-async def ricevi_opzioni(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    options = [opt.strip() for opt in update.message.text.split(',')]
-    if len(options) < 2:
-        await update.message.reply_text("Servono almeno due opzioni!")
-        return OPTIONS
-    context.user_data['options'] = options
-    await update.message.reply_text("Quando vuoi pubblicare il sondaggio? (esempio: 2025-04-29 15:30)")
-    return DATETIME
-
-async def ricevi_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        dt = datetime.strptime(update.message.text, "%Y-%m-%d %H:%M")
-        context.user_data['dt'] = dt.strftime("%Y-%m-%d %H:%M")
-        await update.message.reply_text(
-            "Vuoi che il sondaggio sia:\n- Senza ricorrenza\n- Giornaliera\n- Settimanale\n\nScrivi: nessuna, giornaliera, settimanale"
-        )
-        return RECURRENCE
-    except Exception:
-        await update.message.reply_text("Formato data/ora non valido. Riprova (esempio: 2025-04-29 15:30)")
-        return DATETIME
-
-async def ricevi_ricorrenza(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    recurrence = update.message.text.strip().lower()
-    if recurrence not in ["nessuna", "giornaliera", "settimanale"]:
-        await update.message.reply_text("Rispondi: nessuna, giornaliera, o settimanale.")
-        return RECURRENCE
-    chat_id = update.message.chat_id
-    question = context.user_data['question']
-    options = context.user_data['options']
-    dt = context.user_data['dt']
-    application = context.application
-    # Salva nel DB
-    cur.execute(
-        "INSERT INTO polls (chat_id, question, options, schedule_time, recurrence) VALUES (?, ?, ?, ?, ?)",
-        (chat_id, question, ",".join(options), dt, recurrence)
-    )
-    conn.commit()
-    poll_id = cur.lastrowid
-    # Schedula la pubblicazione
-    scheduler.add_job(
-        partial(pubblica_sondaggio, chat_id, question, options, application, poll_id, recurrence),
-        'date',
-        run_date=datetime.strptime(dt, "%Y-%m-%d %H:%M")
-    )
-    # LOG IMMEDIATO DELLA SCHEDULAZIONE
-    logger.info(f"Sondaggio schedulato per chat_id={chat_id} | Domanda: {question} | Opzioni: {options} | Data: {dt} | Ricorrenza: {recurrence}")
-    await update.message.reply_text(
-        f"Sondaggio programmato per il {dt} con ricorrenza: {recurrence}.\n"
-        f"ATTENZIONE: il bot deve essere amministratore del gruppo e con permesso 'Inviare sondaggi'!"
-    )
-    return ConversationHandler.END
-
-async def annulla(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Operazione annullata.")
-    return ConversationHandler.END
+# --- RIPRISTINO SONDAGGI PERSISTENTI ---
 
 def carica_sondaggi_precedenti(application):
     cur.execute("SELECT id, chat_id, question, options, schedule_time, recurrence FROM polls")
@@ -160,11 +179,16 @@ def carica_sondaggi_precedenti(application):
                 'date',
                 run_date=dt
             )
-            logger.info(f"Sondaggio ripristinato in scheduler per chat_id={chat_id} | Domanda: {question} | Data: {schedule_time} | Ricorrenza: {recurrence}")
+            print(f"--- RIPRISTINATO sondaggio per chat_id={chat_id} | Domanda: {question} | Data: {schedule_time} | Ricorrenza: {recurrence}", flush=True)
+            logger.info(f"Sondaggio ripristinato per chat_id={chat_id} | Domanda: {question} | Data: {schedule_time} | Ricorrenza: {recurrence}")
+
+# --- MAIN ---
 
 if __name__ == "__main__":
+    print("Sto avviando il BOT! Versione aggiornata con /debug!", flush=True)
+
     if not TOKEN:
-        print("Errore: TOKEN non impostato. Devi configurare la variabile d'ambiente TELEGRAM_BOT_TOKEN.")
+        print("Errore: TOKEN non impostato. Devi configurare la variabile d'ambiente TELEGRAM_BOT_TOKEN.", flush=True)
         exit(1)
 
     application = ApplicationBuilder().token(TOKEN).build()
@@ -181,10 +205,10 @@ if __name__ == "__main__":
     )
 
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("debug", debug))   # <-- nuovo comando debug
+    application.add_handler(CommandHandler("debug", debug))
     application.add_handler(conv_handler)
 
     carica_sondaggi_precedenti(application)
 
-    print("Bot in esecuzione... Premi CTRL+C per fermarlo.")
+    print("Bot in esecuzione... Premi CTRL+C per fermarlo.", flush=True)
     application.run_polling()
