@@ -11,13 +11,15 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, ConversationHandler,
     MessageHandler, ContextTypes, filters
 )
+import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
+from timezonefinder import TimezoneFinder
+import requests
 
-# ENV
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 # Conversation states
-QUESTION, OPTIONS, DATETIME, RECURRENCE = range(4)
+SELECT_CITY, QUESTION, OPTIONS, DATETIME, RECURRENCE = range(5)
 
 # DB Setup
 conn = sqlite3.connect('sondaggi.db', check_same_thread=False)
@@ -30,13 +32,16 @@ cur.execute('''CREATE TABLE IF NOT EXISTS polls (
     schedule_time TEXT,
     recurrence TEXT
 )''')
+cur.execute('''CREATE TABLE IF NOT EXISTS chat_settings (
+    chat_id INTEGER PRIMARY KEY,
+    city TEXT,
+    timezone TEXT
+)''')
 conn.commit()
 
-# Scheduler
 scheduler = BackgroundScheduler()
 scheduler.start()
 
-# Logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -44,23 +49,114 @@ logging.basicConfig(
 logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
 logger = logging.getLogger(__name__)
 
+tf = TimezoneFinder()
+
+# --- UTILS ---
+
+def get_timezone_for_city(city_name):
+    # Usa OpenStreetMap Nominatim per trovare lat/lon della città
+    try:
+        url = f"https://nominatim.openstreetmap.org/search?city={city_name}&format=json"
+        response = requests.get(url, headers={"User-Agent": "TelegramPollBot/1.0"})
+        results = response.json()
+        if not results:
+            return None, None
+        lat = float(results[0]['lat'])
+        lon = float(results[0]['lon'])
+        timezone_str = tf.timezone_at(lat=lat, lng=lon)
+        return timezone_str, (lat, lon)
+    except Exception as e:
+        logger.error(f"Errore nel recuperare la timezone per la città {city_name}: {e}")
+        return None, None
+
+def get_timezone_for_chat(chat_id):
+    cur.execute("SELECT timezone FROM chat_settings WHERE chat_id = ?", (chat_id,))
+    row = cur.fetchone()
+    if row and row[0]:
+        return row[0]
+    else:
+        return None
+
+def save_chat_timezone(chat_id, city, timezone):
+    cur.execute("INSERT OR REPLACE INTO chat_settings (chat_id, city, timezone) VALUES (?, ?, ?)",
+        (chat_id, city, timezone))
+    conn.commit()
+
+def get_city_for_chat(chat_id):
+    cur.execute("SELECT city FROM chat_settings WHERE chat_id = ?", (chat_id,))
+    row = cur.fetchone()
+    if row and row[0]:
+        return row[0]
+    else:
+        return None
+
 # --- HANDLERS ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    tz = get_timezone_for_chat(chat_id)
+    if not tz:
+        await update.message.reply_text(
+            "In che città vuoi usare il bot? (scrivi solo il nome della città, esempio: Milano)"
+        )
+        return SELECT_CITY
+    else:
+        city = get_city_for_chat(chat_id)
+        await update.message.reply_text(
+            f"Bot pronto per {city}.\n"
+            "Usa /nuovosondaggio per iniziare.\n"
+            "Comandi utili: /debug /ora"
+        )
+
+async def set_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    city = update.message.text.strip()
+    timezone_str, coords = get_timezone_for_city(city)
+    if not timezone_str:
+        await update.message.reply_text(
+            "Città non trovata! Riprova (esempio: Roma, Napoli, Palermo, New York, London)"
+        )
+        return SELECT_CITY
+    save_chat_timezone(chat_id, city.title(), timezone_str)
     await update.message.reply_text(
-        "Ciao! Questo bot crea sondaggi programmati.\n"
-        "Usa /nuovosondaggio per iniziare.\n"
-        "Comandi utili: /debug /ora"
+        f"Impostata città: {city.title()} (fuso orario: {timezone_str})\n"
+        "Ora puoi usare /nuovosondaggio!"
     )
+    return ConversationHandler.END
 
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    await update.message.reply_text(f"chat_id: {chat_id}")
+    tz = get_timezone_for_chat(chat_id)
+    city = get_city_for_chat(chat_id)
+    await update.message.reply_text(
+        f"chat_id: {chat_id}\n"
+        f"Città: {city or 'Non impostata'}\n"
+        f"Timezone: {tz or 'Non impostato'}"
+    )
 
 async def ora_attuale(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Ora UTC secondo il bot: " + datetime.utcnow().strftime("%Y-%m-%d %H:%M"))
+    chat_id = update.effective_chat.id
+    tz_str = get_timezone_for_chat(chat_id)
+    if not tz_str:
+        await update.message.reply_text("Prima imposta la città con /start")
+        return
+    utc_now = datetime.utcnow()
+    tz = pytz.timezone(tz_str)
+    local_now = pytz.utc.localize(utc_now).astimezone(tz)
+    city = get_city_for_chat(chat_id)
+    await update.message.reply_text(
+        f"Ora locale {city} ({tz_str}): {local_now.strftime('%Y-%m-%d %H:%M')}\n"
+        f"Ora UTC: {utc_now.strftime('%Y-%m-%d %H:%M')}"
+    )
 
 async def nuovosondaggio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    tz = get_timezone_for_chat(chat_id)
+    if not tz:
+        await update.message.reply_text(
+            "Prima imposta la città con /start"
+        )
+        return ConversationHandler.END
     await update.message.reply_text("Scrivi la domanda del sondaggio.")
     return QUESTION
 
@@ -78,19 +174,31 @@ async def ricevi_opzioni(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Telegram permette massimo 10 opzioni. Riprova.")
         return OPTIONS
     context.user_data['options'] = options
+    chat_id = update.effective_chat.id
+    city = get_city_for_chat(chat_id)
     await update.message.reply_text(
-        "Quando vuoi pubblicare il sondaggio?\n"
-        "(Formato: YYYY-MM-DD HH:MM, orario UTC. Scrivi /ora per sapere l'ora UTC attuale)"
+        f"Quando vuoi pubblicare il sondaggio?\n"
+        f"(Formato: YYYY-MM-DD HH:MM, orario LOCALE di {city})"
     )
     return DATETIME
 
 async def ricevi_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    tz_str = get_timezone_for_chat(chat_id)
+    if not tz_str:
+        await update.message.reply_text("Prima imposta la città con /start")
+        return ConversationHandler.END
     try:
-        dt = datetime.strptime(update.message.text, "%Y-%m-%d %H:%M")
-        if dt < datetime.utcnow():
+        local_dt = datetime.strptime(update.message.text, "%Y-%m-%d %H:%M")
+        tz = pytz.timezone(tz_str)
+        local_dt = tz.localize(local_dt)
+        utc_dt = local_dt.astimezone(pytz.utc)
+        if utc_dt < datetime.utcnow().replace(tzinfo=pytz.utc):
             await update.message.reply_text("La data è nel passato. Riprova.")
             return DATETIME
-        context.user_data['dt'] = dt.strftime("%Y-%m-%d %H:%M")
+        context.user_data['dt'] = utc_dt.strftime("%Y-%m-%d %H:%M")
+        context.user_data['local_dt'] = local_dt.strftime("%Y-%m-%d %H:%M")
+        city = get_city_for_chat(chat_id)
         await update.message.reply_text(
             "Vuoi che il sondaggio sia:\n"
             "- Senza ricorrenza\n"
@@ -115,9 +223,9 @@ async def ricevi_ricorrenza(update: Update, context: ContextTypes.DEFAULT_TYPE):
     question = context.user_data['question']
     options = context.user_data['options']
     dt = context.user_data['dt']
+    local_dt = context.user_data['local_dt']
     application = context.application
 
-    # Salva nel DB
     cur.execute(
         "INSERT INTO polls (chat_id, question, options, schedule_time, recurrence) VALUES (?, ?, ?, ?, ?)",
         (chat_id, question, ",".join(options), dt, recurrence)
@@ -125,26 +233,24 @@ async def ricevi_ricorrenza(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     poll_id = cur.lastrowid
 
-    # Schedula la pubblicazione
     scheduler.add_job(
         partial(pubblica_sondaggio, chat_id, question, options, application, poll_id, recurrence),
         'date',
         run_date=datetime.strptime(dt, "%Y-%m-%d %H:%M")
     )
-    print(f"--- SCHEDULATO sondaggio per chat_id={chat_id} | Domanda: {question} | Opzioni: {options} | Data: {dt} | Ricorrenza: {recurrence}", flush=True)
-    logger.info(f"Sondaggio schedulato per chat_id={chat_id} | Domanda: {question} | Opzioni: {options} | Data: {dt} | Ricorrenza: {recurrence}")
-
+    city = get_city_for_chat(chat_id)
     await update.message.reply_text(
-        f"Sondaggio programmato per il {dt} UTC con ricorrenza: {recurrence}.\n"
+        f"Sondaggio programmato per il {local_dt} ({city}) "
+        f"(UTC: {dt}) con ricorrenza: {recurrence}.\n"
         f"ATTENZIONE: il bot deve essere amministratore del gruppo e poter inviare sondaggi!"
     )
+    print(f"--- SCHEDULATO sondaggio per chat_id={chat_id} | Domanda: {question} | Opzioni: {options} | Data(UTC): {dt} | Ricorrenza: {recurrence}", flush=True)
+    logger.info(f"Sondaggio schedulato per chat_id={chat_id} | Domanda: {question} | Opzioni: {options} | Data: {dt} | Ricorrenza: {recurrence}")
     return ConversationHandler.END
 
 async def annulla(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Operazione annullata.")
     return ConversationHandler.END
-
-# --- PUBBLICAZIONE SONDAGGIO ---
 
 async def pubblica_sondaggio(chat_id, question, options, application, poll_id, recurrence):
     try:
@@ -158,7 +264,6 @@ async def pubblica_sondaggio(chat_id, question, options, application, poll_id, r
         )
         print(f"--- INVIATO sondaggio per chat_id={chat_id} a {datetime.utcnow()}", flush=True)
         logger.info(f"Sondaggio pubblicato per chat_id={chat_id} con successo!")
-        # Ricorrenza
         if recurrence == "giornaliera":
             next_time = datetime.utcnow() + timedelta(days=1)
         elif recurrence == "settimanale":
@@ -184,8 +289,6 @@ async def pubblica_sondaggio(chat_id, question, options, application, poll_id, r
         logger.error(f"Errore nell'inviare sondaggio a chat_id={chat_id}: {e}")
         traceback.print_exc()
 
-# --- RIPRISTINO SONDAGGI PERSISTENTI ---
-
 def carica_sondaggi_precedenti(application):
     cur.execute("SELECT id, chat_id, question, options, schedule_time, recurrence FROM polls")
     for poll in cur.fetchall():
@@ -200,10 +303,8 @@ def carica_sondaggi_precedenti(application):
             print(f"--- RIPRISTINATO sondaggio per chat_id={chat_id} | Domanda: {question} | Data: {schedule_time} | Ricorrenza: {recurrence}", flush=True)
             logger.info(f"Sondaggio ripristinato per chat_id={chat_id} | Domanda: {question} | Data: {schedule_time} | Ricorrenza: {recurrence}")
 
-# --- MAIN ---
-
 if __name__ == "__main__":
-    print("Sto avviando il BOT! Versione aggiornata con /debug e /ora!", flush=True)
+    print("Sto avviando il BOT! Versione città/fuso orario auto!", flush=True)
 
     if not TOKEN:
         print("Errore: TOKEN non impostato. Devi configurare la variabile d'ambiente TELEGRAM_BOT_TOKEN.", flush=True)
@@ -214,6 +315,7 @@ if __name__ == "__main__":
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('nuovosondaggio', nuovosondaggio)],
         states={
+            SELECT_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_city)],
             QUESTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_domanda)],
             OPTIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_opzioni)],
             DATETIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_data)],
@@ -222,7 +324,15 @@ if __name__ == "__main__":
         fallbacks=[CommandHandler('annulla', annulla)],
     )
 
-    application.add_handler(CommandHandler("start", start))
+    city_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('start', start)],
+        states={
+            SELECT_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_city)],
+        },
+        fallbacks=[CommandHandler('annulla', annulla)],
+    )
+
+    application.add_handler(city_conv_handler)
     application.add_handler(CommandHandler("debug", debug))
     application.add_handler(CommandHandler("ora", ora_attuale))
     application.add_handler(conv_handler)
