@@ -1,5 +1,4 @@
 import os
-TOKEN = os.getenv("7430014492:AAEh-fyDDfmsIs3ArNFYQCEKY26aD_ROHDg")
 import logging
 from telegram import Update
 from telegram.ext import (
@@ -10,7 +9,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timedelta
 import sqlite3
 
-TOKEN = "7430014492:AAEh-fyDDfmsIs3ArNFYQCEKY26aD_ROHDg"  # <-- metti qui il tuo token!
+# Leggi il token dalla variabile d'ambiente!
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 # Stati della conversazione
 QUESTION, OPTIONS, DATETIME, RECURRENCE = range(4)
@@ -36,9 +36,9 @@ logging.basicConfig(
 )
 
 # Funzione per pubblicare il sondaggio
-async def pubblica_sondaggio(chat_id, question, options, context, poll_id, recurrence):
+async def pubblica_sondaggio(chat_id, question, options, application, poll_id, recurrence):
     try:
-        await context.bot.send_poll(
+        await application.bot.send_poll(
             chat_id=chat_id,
             question=question,
             options=options,
@@ -60,8 +60,8 @@ async def pubblica_sondaggio(chat_id, question, options, context, poll_id, recur
             conn.commit()
             # Rischedula
             scheduler.add_job(
-                lambda: context.application.create_task(
-                    pubblica_sondaggio(chat_id, question, options, context, poll_id, recurrence)
+                lambda: application.create_task(
+                    pubblica_sondaggio(chat_id, question, options, application, poll_id, recurrence)
                 ),
                 'date',
                 run_date=next_time
@@ -123,9 +123,10 @@ async def ricevi_ricorrenza(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     poll_id = cur.lastrowid
     # Programma la pubblicazione
+    application = context.application
     scheduler.add_job(
-        lambda: context.application.create_task(
-            pubblica_sondaggio(chat_id, question, options, context, poll_id, recurrence)
+        lambda: application.create_task(
+            pubblica_sondaggio(chat_id, question, options, application, poll_id, recurrence)
         ),
         'date',
         run_date=datetime.strptime(dt, "%Y-%m-%d %H:%M")
@@ -139,24 +140,27 @@ async def annulla(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Operazione annullata.")
     return ConversationHandler.END
 
-def carica_sondaggi_precedenti(app):
+def carica_sondaggi_precedenti(application):
     cur.execute("SELECT id, chat_id, question, options, schedule_time, recurrence FROM polls")
     for poll in cur.fetchall():
         poll_id, chat_id, question, options, schedule_time, recurrence = poll
         dt = datetime.strptime(schedule_time, "%Y-%m-%d %H:%M")
         if dt > datetime.now():
-            # Programma la pubblicazione
             scheduler.add_job(
                 lambda chat_id=chat_id, question=question, options=options.split(','), poll_id=poll_id, recurrence=recurrence:
-                    app.create_task(
-                        pubblica_sondaggio(chat_id, question, options.split(','), app, poll_id, recurrence)
+                    application.create_task(
+                        pubblica_sondaggio(chat_id, question, options, application, poll_id, recurrence)
                     ),
                 'date',
                 run_date=dt
             )
 
 if __name__ == "__main__":
-    app = ApplicationBuilder().token(TOKEN).build()
+    if not TOKEN:
+        print("Errore: TOKEN non impostato. Devi configurare la variabile d'ambiente TELEGRAM_BOT_TOKEN.")
+        exit(1)
+
+    application = ApplicationBuilder().token(TOKEN).build()
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('nuovosondaggio', nuovosondaggio)],
@@ -169,11 +173,11 @@ if __name__ == "__main__":
         fallbacks=[CommandHandler('annulla', annulla)],
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(conv_handler)
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(conv_handler)
 
     # Al riavvio carica i sondaggi già programmati
-    carica_sondaggi_precedenti(app)
+    carica_sondaggi_precedenti(application)
 
     print("Bot in esecuzione... Premi CTRL+C per fermarlo.")
-    app.run_polling()
+    application.run_polling()
