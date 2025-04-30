@@ -73,21 +73,8 @@ def get_city_for_chat(chat_id):
     row = cur.fetchone()
     return row[0] if row and row[0] else None
 
-def run_async_job(coro_or_func):
-    import asyncio
-    try:
-        if callable(coro_or_func):
-            coro = coro_or_func()
-        else:
-            coro = coro_or_func
-        loop = asyncio.get_running_loop()
-        loop.create_task(coro)
-    except RuntimeError:
-        if callable(coro_or_func):
-            coro = coro_or_func()
-        else:
-            coro = coro_or_func
-        asyncio.run(coro)
+def run_async_job(app, coro_func, *args, **kwargs):
+    app.create_task(coro_func(*args, **kwargs))
 
 def parse_italian_datetime(input_str, tz_str):
     try:
@@ -143,20 +130,12 @@ def parse_recurrence_detail(input_str, tz_str, first_dt_utc):
 
 def remove_job_by_poll_id(poll_id):
     for job in scheduler.get_jobs():
-        if hasattr(job, 'args') and len(job.args) > 0:
-            coro_or_func = job.args[0]
-            try:
-                if callable(coro_or_func):
-                    coro = coro_or_func()
-                else:
-                    coro = coro_or_func
-                coro_poll_id = getattr(coro, 'cr_frame', None)
-                if coro_poll_id:
-                    poll_id_val = coro.cr_frame.f_locals.get('poll_id', None)
-                else:
-                    poll_id_val = None
-            except Exception:
-                poll_id_val = None
+        if hasattr(job, 'args') and len(job.args) > 1:
+            poll_id_val = None
+            for arg in job.args:
+                if isinstance(arg, int) and arg == poll_id:
+                    poll_id_val = arg
+                    break
             if poll_id_val == poll_id:
                 job.remove()
                 break
@@ -486,7 +465,7 @@ async def schedula_sondaggio(update: Update, context: ContextTypes.DEFAULT_TYPE)
             'interval',
             start_date=datetime.strptime(dt, "%Y-%m-%d %H:%M"),
             id=f"poll_{poll_id}",
-            args=(lambda: pubblica_sondaggio(chat_id, question, options, application, poll_id, recurrence, recurrence_detail, is_multiple),),
+            args=(application, pubblica_sondaggio, chat_id, question, options, application, poll_id, recurrence, recurrence_detail, is_multiple),
             **trigger_args
         )
     else:
@@ -495,7 +474,7 @@ async def schedula_sondaggio(update: Update, context: ContextTypes.DEFAULT_TYPE)
             'date',
             run_date=datetime.strptime(dt, "%Y-%m-%d %H:%M"),
             id=f"poll_{poll_id}",
-            args=(lambda: pubblica_sondaggio(chat_id, question, options, application, poll_id, recurrence, recurrence_detail, is_multiple),)
+            args=(application, pubblica_sondaggio, chat_id, question, options, application, poll_id, recurrence, recurrence_detail, is_multiple)
         )
     city = get_city_for_chat(chat_id)
     multi_txt = "multi-risposta" if is_multiple else "singola risposta"
@@ -554,7 +533,7 @@ async def pubblica_sondaggio(chat_id, question, options, application, poll_id, r
                     'date',
                     run_date=next_time,
                     id=f"poll_{poll_id}",
-                    args=(lambda: pubblica_sondaggio(chat_id, question, options, application, poll_id, recurrence, recurrence_detail, is_multiple),)
+                    args=(application, pubblica_sondaggio, chat_id, question, options, application, poll_id, recurrence, recurrence_detail, is_multiple)
                 )
             else:
                 cur.execute("DELETE FROM polls WHERE id = ?", (poll_id,))
@@ -584,7 +563,7 @@ def carica_sondaggi_precedenti(application):
                 'interval',
                 start_date=dt,
                 id=f"poll_{poll_id}",
-                args=(lambda: pubblica_sondaggio(chat_id, question, options_list, application, poll_id, recurrence, recurrence_detail, is_multiple),),
+                args=(application, pubblica_sondaggio, chat_id, question, options_list, application, poll_id, recurrence, recurrence_detail, is_multiple),
                 **trigger_args
             )
         elif dt > datetime.now(pytz.utc):
@@ -593,7 +572,7 @@ def carica_sondaggi_precedenti(application):
                 'date',
                 run_date=dt,
                 id=f"poll_{poll_id}",
-                args=(lambda: pubblica_sondaggio(chat_id, question, options_list, application, poll_id, recurrence, recurrence_detail, is_multiple),)
+                args=(application, pubblica_sondaggio, chat_id, question, options_list, application, poll_id, recurrence, recurrence_detail, is_multiple)
             )
 
 async def mod_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -720,7 +699,7 @@ async def mod_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'interval',
             start_date=datetime.strptime(dt, "%Y-%m-%d %H:%M"),
             id=f"poll_{poll_id}",
-            args=(lambda: pubblica_sondaggio(update.effective_chat.id, question, options, application, poll_id, recurrence, recurrence_detail, is_multiple),),
+            args=(application, pubblica_sondaggio, update.effective_chat.id, question, options, application, poll_id, recurrence, recurrence_detail, is_multiple),
             **trigger_args
         )
     else:
@@ -729,7 +708,7 @@ async def mod_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'date',
             run_date=datetime.strptime(dt, "%Y-%m-%d %H:%M"),
             id=f"poll_{poll_id}",
-            args=(lambda: pubblica_sondaggio(update.effective_chat.id, question, options, application, poll_id, recurrence, recurrence_detail, is_multiple),)
+            args=(application, pubblica_sondaggio, update.effective_chat.id, question, options, application, poll_id, recurrence, recurrence_detail, is_multiple)
         )
     await update.message.reply_text("Sondaggio aggiornato!")
     return ConversationHandler.END
