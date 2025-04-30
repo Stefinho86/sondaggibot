@@ -23,7 +23,6 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 SELECT_CITY, Q, OPTS, DT, REC, REC_DETAIL = range(6)
 MOD_SELECT, MOD_Q, MOD_O, MOD_D, MOD_R, MOD_RD = range(10, 16)
-CANCEL_SELECT, MODIFY_SELECT = range(20, 22)
 
 conn = sqlite3.connect('sondaggi.db', check_same_thread=False)
 cur = conn.cursor()
@@ -92,10 +91,20 @@ def parse_italian_datetime(input_str, tz_str):
 
 def parse_recurrence_detail(input_str, tz_str, first_dt_utc):
     input_str = input_str.lower().strip()
-    weekdays = {
-        "lunedì": 0, "lunedi": 0, "martedì": 1, "martedi": 1, "mercoledì": 2, "mercoledi": 2,
-        "giovedì": 3, "giovedi": 3, "venerdì": 4, "venerdi": 4, "sabato": 5, "domenica": 6
-    }
+    # ogni X minuti/ore/secondi
+    m = re.match(r"ogni\s+(\d+)\s*(minuti|minuto|min|m)", input_str)
+    if m:
+        minutes = int(m.group(1))
+        return ("intervallo", timedelta(minutes=minutes), f"intervallo|{minutes}|minuti")
+    m = re.match(r"ogni\s+(\d+)\s*(ore|ora|h)", input_str)
+    if m:
+        hours = int(m.group(1))
+        return ("intervallo", timedelta(hours=hours), f"intervallo|{hours}|ore")
+    m = re.match(r"ogni\s+(\d+)\s*(secondi|secondo|sec|s)", input_str)
+    if m:
+        seconds = int(m.group(1))
+        return ("intervallo", timedelta(seconds=seconds), f"intervallo|{seconds}|secondi")
+    # ogni giorno alle HH.MM
     m = re.match(r"ogni giorno alle (\d{1,2})[.:](\d{2})", input_str)
     if m:
         hour, minute = int(m.group(1)), int(m.group(2))
@@ -106,6 +115,11 @@ def parse_recurrence_detail(input_str, tz_str, first_dt_utc):
             candidate += timedelta(days=1)
         next_run_utc = candidate.astimezone(pytz.utc)
         return ("giornaliera", next_run_utc, f"giornaliera|{hour:02d}.{minute:02d}")
+    # ogni lunedì/martedì... alle HH.MM
+    weekdays = {
+        "lunedì": 0, "lunedi": 0, "martedì": 1, "martedi": 1, "mercoledì": 2, "mercoledi": 2,
+        "giovedì": 3, "giovedi": 3, "venerdì": 4, "venerdi": 4, "sabato": 5, "domenica": 6
+    }
     m = re.match(r"ogni (\w+) alle (\d{1,2})[.:](\d{2})", input_str)
     if m and m.group(1) in weekdays:
         wd = weekdays[m.group(1)]
@@ -230,44 +244,26 @@ async def lista_sondaggi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = "Sondaggi programmati:\n"
     for i, r in enumerate(rows, 1):
         id, q, t, rec, det = r
-        msg += f"{i}. {q} ({t})\n"
+        msg += f"{i}. {q} (ID: {id}) ({t})\n"
         if rec != "nessuna":
             msg += f"   Ricorrenza: {rec} ({det})\n"
     await update.message.reply_text(msg)
 
 async def cancella_sondaggio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    cur.execute("SELECT id, question, schedule_time FROM polls WHERE chat_id = ?", (chat_id,))
+    cur.execute("SELECT id, question FROM polls WHERE chat_id = ?", (chat_id,))
     rows = cur.fetchall()
     if not rows:
         await update.message.reply_text("Non ci sono sondaggi da cancellare.")
-        return ConversationHandler.END
-    if not context.args:
-        keyboard = [
-            [InlineKeyboardButton(f"{i+1}. {row[1]}", callback_data=f"cancel_{row[0]}")]
-            for i, row in enumerate(rows)
-        ]
-        await update.message.reply_text("Seleziona il sondaggio da cancellare:", reply_markup=InlineKeyboardMarkup(keyboard))
-        return CANCEL_SELECT
-    arg = context.args[0]
-    if arg.isdigit():
-        idx = int(arg) - 1
-        if 0 <= idx < len(rows):
-            poll_id = rows[idx][0]
-        else:
-            await update.message.reply_text("Indice non valido.")
-            return ConversationHandler.END
-    else:
-        await update.message.reply_text("Usa: /cancella <numero sondaggio>")
-        return ConversationHandler.END
-    await _do_cancel_poll(update, poll_id)
-    return ConversationHandler.END
-
-async def _do_cancel_poll(update, poll_id):
-    cur.execute("DELETE FROM polls WHERE id=?", (poll_id,))
-    conn.commit()
-    remove_job_by_poll_id(poll_id)
-    await update.message.reply_text(f"Sondaggio cancellato.")
+        return
+    keyboard = [
+        [InlineKeyboardButton(f"{row[1]} (ID: {row[0]})", callback_data=f"cancel_{row[0]}")]
+        for row in rows
+    ]
+    await update.message.reply_text(
+        "Seleziona il sondaggio da cancellare oppure invia l'ID:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 async def cancella_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -275,34 +271,42 @@ async def cancella_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     if not data.startswith("cancel_"): return
     poll_id = int(data.split("_")[1])
-    await _do_cancel_poll(query, poll_id)
+    cur.execute("DELETE FROM polls WHERE id=?", (poll_id,))
+    conn.commit()
+    remove_job_by_poll_id(poll_id)
+    await query.edit_message_text(f"Sondaggio cancellato.")
+
+async def cancella_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    text = update.message.text.strip()
+    if text.isdigit():
+        poll_id = int(text)
+        cur.execute("SELECT id FROM polls WHERE chat_id = ? AND id = ?", (chat_id, poll_id))
+        if cur.fetchone():
+            cur.execute("DELETE FROM polls WHERE id=?", (poll_id,))
+            conn.commit()
+            remove_job_by_poll_id(poll_id)
+            await update.message.reply_text(f"Sondaggio cancellato.")
+        else:
+            await update.message.reply_text("ID non trovato.")
+    # Non bloccare altri comandi
+    return
 
 async def modifica_sondaggio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    cur.execute("SELECT id, question, schedule_time FROM polls WHERE chat_id = ?", (chat_id,))
+    cur.execute("SELECT id, question FROM polls WHERE chat_id = ?", (chat_id,))
     rows = cur.fetchall()
     if not rows:
         await update.message.reply_text("Non ci sono sondaggi da modificare.")
-        return ConversationHandler.END
-    if not context.args:
-        keyboard = [
-            [InlineKeyboardButton(f"{i+1}. {row[1]}", callback_data=f"modify_{row[0]}")]
-            for i, row in enumerate(rows)
-        ]
-        await update.message.reply_text("Seleziona il sondaggio da modificare:", reply_markup=InlineKeyboardMarkup(keyboard))
-        return MODIFY_SELECT
-    arg = context.args[0]
-    if arg.isdigit():
-        idx = int(arg) - 1
-        if 0 <= idx < len(rows):
-            poll_id = rows[idx][0]
-        else:
-            await update.message.reply_text("Indice non valido.")
-            return ConversationHandler.END
-    else:
-        await update.message.reply_text("Usa: /modifica <numero sondaggio>")
-        return ConversationHandler.END
-    return await _start_modifica(update, context, poll_id)
+        return
+    keyboard = [
+        [InlineKeyboardButton(f"{row[1]} (ID: {row[0]})", callback_data=f"modify_{row[0]}")]
+        for row in rows
+    ]
+    await update.message.reply_text(
+        "Seleziona il sondaggio da modificare oppure invia l'ID:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 async def modifica_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -310,15 +314,26 @@ async def modifica_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     if not data.startswith("modify_"): return
     poll_id = int(data.split("_")[1])
-    return await _start_modifica(query, context, poll_id)
+    await _start_modifica2(update, context, poll_id)
 
-async def _start_modifica(update_or_query, context, poll_id):
+async def modifica_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    text = update.message.text.strip()
+    if text.isdigit():
+        poll_id = int(text)
+        cur.execute("SELECT id FROM polls WHERE chat_id = ? AND id = ?", (chat_id, poll_id))
+        if cur.fetchone():
+            await _start_modifica2(update, context, poll_id)
+        else:
+            await update.message.reply_text("ID non trovato.")
+
+async def _start_modifica2(update_or_query, context, poll_id):
     chat_id = update_or_query.effective_chat.id
     cur.execute("SELECT question, options, schedule_time, recurrence, recurrence_detail FROM polls WHERE id=? AND chat_id=?", (poll_id, chat_id))
     row = cur.fetchone()
     if not row:
         await update_or_query.message.reply_text("Sondaggio non trovato.")
-        return ConversationHandler.END
+        return
     context.user_data['mod_poll_id'] = poll_id
     context.user_data['question'], options, schedule_time, recurrence, rec_detail = row
     context.user_data['options'] = options.split(',')
@@ -335,7 +350,7 @@ async def nuovosondaggio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tz = get_timezone_for_chat(chat_id)
     if not tz:
         await update.message.reply_text("Prima imposta la città con /start o /cambia_citta")
-        return ConversationHandler.END
+        return
     await update.message.reply_text("Scrivi la domanda del sondaggio.")
     return Q
 
@@ -385,7 +400,7 @@ async def ricevi_ask_ricorrenza(update: Update, context: ContextTypes.DEFAULT_TY
         return await schedula_sondaggio(update, context)
     elif risposta == "si":
         await update.message.reply_text(
-            "Ogni quanto?\nEsempi:\n- ogni giorno alle 18.30\n- ogni martedì alle 10.00"
+            "Ogni quanto?\nEsempi:\n- ogni 5 minuti\n- ogni giorno alle 18.30\n- ogni martedì alle 10.00"
         )
         return REC_DETAIL
     await update.message.reply_text("Rispondi: no oppure si.")
@@ -396,15 +411,19 @@ async def ricevi_recurrence_detail(update: Update, context: ContextTypes.DEFAULT
     tz_str = get_timezone_for_chat(chat_id)
     dt = context.user_data['dt']
     first_dt_utc = datetime.strptime(dt, "%Y-%m-%d %H:%M").replace(tzinfo=pytz.utc)
-    kind, next_run_utc, detail = parse_recurrence_detail(update.message.text, tz_str, first_dt_utc)
-    if not kind or not next_run_utc:
+    kind, interval_or_next, detail = parse_recurrence_detail(update.message.text, tz_str, first_dt_utc)
+    if not kind or not interval_or_next:
         await update.message.reply_text(
-            "Non capisco la ricorrenza. Esempi:\n- ogni giorno alle 18.30\n- ogni martedì alle 10.00"
+            "Non capisco la ricorrenza. Esempi:\n- ogni 5 minuti\n- ogni giorno alle 18.30\n- ogni martedì alle 10.00"
         )
         return REC_DETAIL
     context.user_data['recurrence'] = kind
     context.user_data['recurrence_detail'] = detail
-    context.user_data['dt'] = next_run_utc.strftime("%Y-%m-%d %H:%M")
+    if kind == "intervallo":
+        # Ricorrenza a intervallo: la prima pubblicazione è dt, poi ogni X minuti/ore/secondi
+        pass
+    else:
+        context.user_data['dt'] = interval_or_next.strftime("%Y-%m-%d %H:%M")
     return await schedula_sondaggio(update, context)
 
 async def schedula_sondaggio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -422,12 +441,34 @@ async def schedula_sondaggio(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
     conn.commit()
     poll_id = cur.lastrowid
-    scheduler.add_job(
-        run_async_job,
-        'date',
-        run_date=datetime.strptime(dt, "%Y-%m-%d %H:%M"),
-        args=(pubblica_sondaggio(chat_id, question, options, application, poll_id, recurrence, recurrence_detail),)
-    )
+    if recurrence == "intervallo":
+        # Ricorrenza intervallo: usa scheduler.add_job con trigger=interval, start_date=dt
+        _, value, unit = recurrence_detail.split("|")
+        value = int(value)
+        if unit == "minuti":
+            trigger_args = dict(minutes=value)
+        elif unit == "ore":
+            trigger_args = dict(hours=value)
+        elif unit == "secondi":
+            trigger_args = dict(seconds=value)
+        else:
+            trigger_args = dict(minutes=5)
+        scheduler.add_job(
+            run_async_job,
+            'interval',
+            start_date=datetime.strptime(dt, "%Y-%m-%d %H:%M"),
+            id=f"poll_{poll_id}",
+            args=(pubblica_sondaggio(chat_id, question, options, application, poll_id, recurrence, recurrence_detail),),
+            **trigger_args
+        )
+    else:
+        scheduler.add_job(
+            run_async_job,
+            'date',
+            run_date=datetime.strptime(dt, "%Y-%m-%d %H:%M"),
+            id=f"poll_{poll_id}",
+            args=(pubblica_sondaggio(chat_id, question, options, application, poll_id, recurrence, recurrence_detail),)
+        )
     city = get_city_for_chat(chat_id)
     await update.message.reply_text(
         f"Sondaggio programmato per il {local_dt} ({city})\nRicorrenza: {recurrence if recurrence != 'nessuna' else 'nessuna'}"
@@ -446,44 +487,49 @@ async def pubblica_sondaggio(chat_id, question, options, application, poll_id, r
             options=options,
             is_anonymous=False
         )
-        next_time = None
-        if recurrence == "giornaliera":
-            _, hourmin = recurrence_detail.split("|")
-            hour, minute = map(int, hourmin.split("."))
-            tz_str = get_timezone_for_chat(chat_id)
-            tz = pytz.timezone(tz_str)
-            now_local = datetime.utcnow().astimezone(tz)
-            candidate = now_local + timedelta(days=1)
-            candidate = candidate.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            next_time = candidate.astimezone(pytz.utc)
-        elif recurrence == "settimanale":
-            _, wd, hourmin = recurrence_detail.split("|")
-            wd = int(wd)
-            hour, minute = map(int, hourmin.split("."))
-            tz_str = get_timezone_for_chat(chat_id)
-            tz = pytz.timezone(tz_str)
-            now_local = datetime.utcnow().astimezone(tz)
-            days_ahead = (wd - now_local.weekday() + 7) % 7
-            candidate = now_local + timedelta(days=days_ahead)
-            candidate = candidate.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            if candidate <= now_local:
-                candidate += timedelta(weeks=1)
-            next_time = candidate.astimezone(pytz.utc)
-        if next_time:
-            cur.execute(
-                "UPDATE polls SET schedule_time = ? WHERE id = ?",
-                (next_time.strftime("%Y-%m-%d %H:%M"), poll_id)
-            )
-            conn.commit()
-            scheduler.add_job(
-                run_async_job,
-                'date',
-                run_date=next_time,
-                args=(pubblica_sondaggio(chat_id, question, options, application, poll_id, recurrence, recurrence_detail),)
-            )
+        if recurrence == "intervallo":
+            # Non serve rischedulare, lo fa apscheduler
+            pass
         else:
-            cur.execute("DELETE FROM polls WHERE id = ?", (poll_id,))
-            conn.commit()
+            next_time = None
+            if recurrence == "giornaliera":
+                _, hourmin = recurrence_detail.split("|")
+                hour, minute = map(int, hourmin.split("."))
+                tz_str = get_timezone_for_chat(chat_id)
+                tz = pytz.timezone(tz_str)
+                now_local = datetime.utcnow().astimezone(tz)
+                candidate = now_local + timedelta(days=1)
+                candidate = candidate.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                next_time = candidate.astimezone(pytz.utc)
+            elif recurrence == "settimanale":
+                _, wd, hourmin = recurrence_detail.split("|")
+                wd = int(wd)
+                hour, minute = map(int, hourmin.split("."))
+                tz_str = get_timezone_for_chat(chat_id)
+                tz = pytz.timezone(tz_str)
+                now_local = datetime.utcnow().astimezone(tz)
+                days_ahead = (wd - now_local.weekday() + 7) % 7
+                candidate = now_local + timedelta(days=days_ahead)
+                candidate = candidate.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if candidate <= now_local:
+                    candidate += timedelta(weeks=1)
+                next_time = candidate.astimezone(pytz.utc)
+            if next_time:
+                cur.execute(
+                    "UPDATE polls SET schedule_time = ? WHERE id = ?",
+                    (next_time.strftime("%Y-%m-%d %H:%M"), poll_id)
+                )
+                conn.commit()
+                scheduler.add_job(
+                    run_async_job,
+                    'date',
+                    run_date=next_time,
+                    id=f"poll_{poll_id}",
+                    args=(pubblica_sondaggio(chat_id, question, options, application, poll_id, recurrence, recurrence_detail),)
+                )
+            else:
+                cur.execute("DELETE FROM polls WHERE id = ?", (poll_id,))
+                conn.commit()
     except Exception as e:
         traceback.print_exc()
 
@@ -492,11 +538,31 @@ def carica_sondaggi_precedenti(application):
     for poll in cur.fetchall():
         poll_id, chat_id, question, options, schedule_time, recurrence, recurrence_detail = poll
         dt = datetime.strptime(schedule_time, "%Y-%m-%d %H:%M")
-        if dt > datetime.utcnow():
+        if recurrence == "intervallo":
+            _, value, unit = recurrence_detail.split("|")
+            value = int(value)
+            if unit == "minuti":
+                trigger_args = dict(minutes=value)
+            elif unit == "ore":
+                trigger_args = dict(hours=value)
+            elif unit == "secondi":
+                trigger_args = dict(seconds=value)
+            else:
+                trigger_args = dict(minutes=5)
+            scheduler.add_job(
+                run_async_job,
+                'interval',
+                start_date=dt,
+                id=f"poll_{poll_id}",
+                args=(pubblica_sondaggio(chat_id, question, options.split(','), application, poll_id, recurrence, recurrence_detail),),
+                **trigger_args
+            )
+        elif dt > datetime.utcnow():
             scheduler.add_job(
                 run_async_job,
                 'date',
                 run_date=dt,
+                id=f"poll_{poll_id}",
                 args=(pubblica_sondaggio(chat_id, question, options.split(','), application, poll_id, recurrence, recurrence_detail),)
             )
 
@@ -554,7 +620,7 @@ async def mod_rec(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Ricorrenza rimossa. Altra modifica? (domanda, opzioni, data, ricorrenza, niente)")
         return MOD_SELECT
     elif txt == "si":
-        await update.message.reply_text("Ogni quanto? (es: ogni giorno alle 18.30, ogni martedì alle 10.00)")
+        await update.message.reply_text("Ogni quanto? (es: ogni 5 minuti, ogni giorno alle 18.30, ogni martedì alle 10.00)")
         return MOD_RD
     else:
         await update.message.reply_text("Rispondi si oppure no.")
@@ -565,13 +631,16 @@ async def mod_rec_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tz_str = get_timezone_for_chat(chat_id)
     dt = context.user_data['dt']
     first_dt_utc = datetime.strptime(dt, "%Y-%m-%d %H:%M").replace(tzinfo=pytz.utc)
-    kind, next_run_utc, detail = parse_recurrence_detail(update.message.text, tz_str, first_dt_utc)
-    if not kind or not next_run_utc:
+    kind, interval_or_next, detail = parse_recurrence_detail(update.message.text, tz_str, first_dt_utc)
+    if not kind or not interval_or_next:
         await update.message.reply_text("Non capisco la ricorrenza.")
         return MOD_RD
     context.user_data['recurrence'] = kind
     context.user_data['recurrence_detail'] = detail
-    context.user_data['dt'] = next_run_utc.strftime("%Y-%m-%d %H:%M")
+    if kind == "intervallo":
+        pass
+    else:
+        context.user_data['dt'] = interval_or_next.strftime("%Y-%m-%d %H:%M")
     await update.message.reply_text("Ricorrenza aggiornata. Altra modifica? (domanda, opzioni, data, ricorrenza, niente)")
     return MOD_SELECT
 
@@ -589,12 +658,33 @@ async def mod_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     remove_job_by_poll_id(poll_id)
     application = context.application
-    scheduler.add_job(
-        run_async_job,
-        'date',
-        run_date=datetime.strptime(dt, "%Y-%m-%d %H:%M"),
-        args=(pubblica_sondaggio(update.effective_chat.id, question, options, application, poll_id, recurrence, recurrence_detail),)
-    )
+    if recurrence == "intervallo":
+        _, value, unit = recurrence_detail.split("|")
+        value = int(value)
+        if unit == "minuti":
+            trigger_args = dict(minutes=value)
+        elif unit == "ore":
+            trigger_args = dict(hours=value)
+        elif unit == "secondi":
+            trigger_args = dict(seconds=value)
+        else:
+            trigger_args = dict(minutes=5)
+        scheduler.add_job(
+            run_async_job,
+            'interval',
+            start_date=datetime.strptime(dt, "%Y-%m-%d %H:%M"),
+            id=f"poll_{poll_id}",
+            args=(pubblica_sondaggio(update.effective_chat.id, question, options, application, poll_id, recurrence, recurrence_detail),),
+            **trigger_args
+        )
+    else:
+        scheduler.add_job(
+            run_async_job,
+            'date',
+            run_date=datetime.strptime(dt, "%Y-%m-%d %H:%M"),
+            id=f"poll_{poll_id}",
+            args=(pubblica_sondaggio(update.effective_chat.id, question, options, application, poll_id, recurrence, recurrence_detail),)
+        )
     await update.message.reply_text("Sondaggio aggiornato!")
     return ConversationHandler.END
 
@@ -622,14 +712,12 @@ if __name__ == "__main__":
             DT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_data)],
             REC: [MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_ask_ricorrenza)],
             REC_DETAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_recurrence_detail)],
-            CANCEL_SELECT: [CallbackQueryHandler(cancella_callback, pattern="^cancel_")],
-            MODIFY_SELECT: [CallbackQueryHandler(modifica_callback, pattern="^modify_")],
         },
         fallbacks=[CommandHandler('annulla', annulla)],
     )
 
     mod_conv = ConversationHandler(
-        entry_points=[CommandHandler('modifica', modifica_sondaggio)],
+        entry_points=[MessageHandler((filters.Regex(r"^\d+$") | filters.COMMAND) & filters.ChatType.PRIVATE, modifica_id)],
         states={
             MOD_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, mod_select)],
             MOD_Q: [MessageHandler(filters.TEXT & ~filters.COMMAND, mod_question)],
@@ -656,7 +744,15 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("debug", debug))
     application.add_handler(CommandHandler("ora", ora_attuale))
     application.add_handler(CommandHandler("sondaggi", lista_sondaggi))
+
     application.add_handler(CommandHandler("cancella", cancella_sondaggio))
+    application.add_handler(CallbackQueryHandler(cancella_callback, pattern="^cancel_"))
+    application.add_handler(MessageHandler(filters.Regex(r"^\d+$") & filters.TEXT, cancella_id))
+
+    application.add_handler(CommandHandler("modifica", modifica_sondaggio))
+    application.add_handler(CallbackQueryHandler(modifica_callback, pattern="^modify_"))
+    application.add_handler(MessageHandler(filters.Regex(r"^\d+$") & filters.TEXT, modifica_id))
+
     application.add_handler(conv_handler)
     application.add_handler(mod_conv)
 
