@@ -15,11 +15,12 @@ import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from timezonefinder import TimezoneFinder
 import requests
+import re
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 # Conversation states
-SELECT_CITY, QUESTION, OPTIONS, DATETIME, RECURRENCE = range(5)
+SELECT_CITY, QUESTION, OPTIONS, DATETIME, ASK_RECURRENCE, RECURRENCE_DETAIL = range(6)
 
 # DB Setup
 conn = sqlite3.connect('sondaggi.db', check_same_thread=False)
@@ -30,7 +31,8 @@ cur.execute('''CREATE TABLE IF NOT EXISTS polls (
     question TEXT,
     options TEXT,
     schedule_time TEXT,
-    recurrence TEXT
+    recurrence TEXT,
+    recurrence_detail TEXT
 )''')
 cur.execute('''CREATE TABLE IF NOT EXISTS chat_settings (
     chat_id INTEGER PRIMARY KEY,
@@ -89,7 +91,6 @@ def get_city_for_chat(chat_id):
     else:
         return None
 
-# --- APSCHEDULER PATCH: RUN ASYNC JOBS ---
 def run_async_job(coro):
     import asyncio
     try:
@@ -101,6 +102,58 @@ def run_async_job(coro):
         asyncio.ensure_future(coro)
     else:
         loop.run_until_complete(coro)
+
+def parse_italian_datetime(input_str, tz_str):
+    """
+    Accetta stringa nel formato GG/MM/AAAA HH.MM e restituisce (utc_datetime, local_datetime)
+    """
+    try:
+        dt = datetime.strptime(input_str, "%d/%m/%Y %H.%M")
+        tz = pytz.timezone(tz_str)
+        local_dt = tz.localize(dt)
+        utc_dt = local_dt.astimezone(pytz.utc)
+        return utc_dt, local_dt
+    except Exception as e:
+        return None, None
+
+def parse_recurrence_detail(input_str, tz_str, first_dt_utc):
+    """
+    Interpreta input come 'ogni martedì alle 10.00', 'ogni giorno alle 18.30'
+    Restituisce (tipo, next_run_utc, recurrence_detail)
+    """
+    input_str = input_str.lower().strip()
+    weekdays = {
+        "lunedì": 0, "lunedi": 0, "martedì": 1, "martedi": 1, "mercoledì": 2, "mercoledi": 2,
+        "giovedì": 3, "giovedi": 3, "venerdì": 4, "venerdi": 4, "sabato": 5, "domenica": 6
+    }
+    # ogni giorno alle HH.MM
+    m = re.match(r"ogni giorno alle (\d{1,2})[.:](\d{2})", input_str)
+    if m:
+        hour, minute = int(m.group(1)), int(m.group(2))
+        # calcola prossimo run dopo first_dt_utc
+        tz = pytz.timezone(tz_str)
+        now_local = first_dt_utc.astimezone(tz)
+        candidate = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate <= now_local:
+            candidate += timedelta(days=1)
+        next_run_utc = candidate.astimezone(pytz.utc)
+        return ("giornaliera", next_run_utc, f"giornaliera|{hour:02d}.{minute:02d}")
+    # ogni [giorno della settimana] alle HH.MM
+    m = re.match(r"ogni (\w+) alle (\d{1,2})[.:](\d{2})", input_str)
+    if m and m.group(1) in weekdays:
+        wd = weekdays[m.group(1)]
+        hour, minute = int(m.group(2)), int(m.group(3))
+        tz = pytz.timezone(tz_str)
+        now_local = first_dt_utc.astimezone(tz)
+        days_ahead = (wd - now_local.weekday() + 7) % 7
+        candidate = now_local + timedelta(days=days_ahead)
+        candidate = candidate.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate <= now_local:
+            candidate += timedelta(weeks=1)
+        next_run_utc = candidate.astimezone(pytz.utc)
+        return ("settimanale", next_run_utc, f"settimanale|{wd}|{hour:02d}.{minute:02d}")
+    # fallback: errore
+    return (None, None, None)
 
 # --- HANDLERS ---
 
@@ -157,8 +210,8 @@ async def ora_attuale(update: Update, context: ContextTypes.DEFAULT_TYPE):
     local_now = pytz.utc.localize(utc_now).astimezone(tz)
     city = get_city_for_chat(chat_id)
     await update.message.reply_text(
-        f"Ora locale {city} ({tz_str}): {local_now.strftime('%Y-%m-%d %H:%M')}\n"
-        f"Ora UTC: {utc_now.strftime('%Y-%m-%d %H:%M')}"
+        f"Ora locale {city} ({tz_str}): {local_now.strftime('%d/%m/%Y %H.%M')}\n"
+        f"Ora UTC: {utc_now.strftime('%d/%m/%Y %H.%M')}"
     )
 
 async def nuovosondaggio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -190,7 +243,7 @@ async def ricevi_opzioni(update: Update, context: ContextTypes.DEFAULT_TYPE):
     city = get_city_for_chat(chat_id)
     await update.message.reply_text(
         f"Quando vuoi pubblicare il sondaggio?\n"
-        f"(Formato: YYYY-MM-DD HH:MM, orario LOCALE di {city})"
+        f"(Formato: GG/MM/AAAA HH.MM, orario LOCALE di {city})"
     )
     return DATETIME
 
@@ -200,47 +253,74 @@ async def ricevi_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not tz_str:
         await update.message.reply_text("Prima imposta la città con /start")
         return ConversationHandler.END
-    try:
-        local_dt = datetime.strptime(update.message.text, "%Y-%m-%d %H:%M")
-        tz = pytz.timezone(tz_str)
-        local_dt = tz.localize(local_dt)
-        utc_dt = local_dt.astimezone(pytz.utc)
-        if utc_dt < datetime.utcnow().replace(tzinfo=pytz.utc):
-            await update.message.reply_text("La data è nel passato. Riprova.")
-            return DATETIME
-        context.user_data['dt'] = utc_dt.strftime("%Y-%m-%d %H:%M")
-        context.user_data['local_dt'] = local_dt.strftime("%Y-%m-%d %H:%M")
-        city = get_city_for_chat(chat_id)
+    utc_dt, local_dt = parse_italian_datetime(update.message.text, tz_str)
+    if not utc_dt:
         await update.message.reply_text(
-            "Vuoi che il sondaggio sia:\n"
-            "- Senza ricorrenza\n"
-            "- Giornaliera\n"
-            "- Settimanale\n"
-            "Scrivi: nessuna, giornaliera, settimanale"
-        )
-        return RECURRENCE
-    except Exception:
-        await update.message.reply_text(
-            "Formato data/ora non valido. Riprova (esempio: 2025-04-30 16:00)"
+            "Formato data/ora non valido. Riprova (esempio: 30/04/2025 16.30)"
         )
         return DATETIME
+    if utc_dt < datetime.utcnow().replace(tzinfo=pytz.utc):
+        await update.message.reply_text("La data è nel passato. Riprova.")
+        return DATETIME
+    context.user_data['dt'] = utc_dt.strftime("%Y-%m-%d %H:%M")
+    context.user_data['local_dt'] = local_dt.strftime("%d/%m/%Y %H.%M")
+    await update.message.reply_text(
+        "Vuoi che il sondaggio sia pubblicato ricorrentemente?\n"
+        "Scrivi:\n"
+        "- no (pubblica solo una volta)\n"
+        "- si (richiederà dettagli dopo)"
+    )
+    return ASK_RECURRENCE
 
-async def ricevi_ricorrenza(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    recurrence = update.message.text.strip().lower()
-    if recurrence not in ["nessuna", "giornaliera", "settimanale"]:
-        await update.message.reply_text("Rispondi: nessuna, giornaliera, o settimanale.")
-        return RECURRENCE
+async def ricevi_ask_ricorrenza(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    risposta = update.message.text.strip().lower()
+    if risposta == "no":
+        context.user_data['recurrence'] = "nessuna"
+        context.user_data['recurrence_detail'] = ""
+        return await schedula_sondaggio(update, context)
+    elif risposta == "si":
+        await update.message.reply_text(
+            "Ogni quanto deve essere pubblicato il sondaggio?\n"
+            "Esempi:\n"
+            "- ogni giorno alle 18.30\n"
+            "- ogni martedì alle 10.00"
+        )
+        return RECURRENCE_DETAIL
+    else:
+        await update.message.reply_text("Rispondi: no oppure si.")
+        return ASK_RECURRENCE
 
+async def ricevi_recurrence_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    tz_str = get_timezone_for_chat(chat_id)
+    dt = context.user_data['dt']
+    first_dt_utc = datetime.strptime(dt, "%Y-%m-%d %H:%M").replace(tzinfo=pytz.utc)
+    kind, next_run_utc, detail = parse_recurrence_detail(update.message.text, tz_str, first_dt_utc)
+    if not kind or not next_run_utc:
+        await update.message.reply_text(
+            "Non riesco a capire la ricorrenza. Esempi validi:\n"
+            "- ogni giorno alle 18.30\n"
+            "- ogni martedì alle 10.00"
+        )
+        return RECURRENCE_DETAIL
+    context.user_data['recurrence'] = kind
+    context.user_data['recurrence_detail'] = detail
+    context.user_data['dt'] = next_run_utc.strftime("%Y-%m-%d %H:%M")
+    return await schedula_sondaggio(update, context)
+
+async def schedula_sondaggio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     question = context.user_data['question']
     options = context.user_data['options']
     dt = context.user_data['dt']
     local_dt = context.user_data['local_dt']
+    recurrence = context.user_data.get('recurrence', "nessuna")
+    recurrence_detail = context.user_data.get('recurrence_detail', "")
     application = context.application
 
     cur.execute(
-        "INSERT INTO polls (chat_id, question, options, schedule_time, recurrence) VALUES (?, ?, ?, ?, ?)",
-        (chat_id, question, ",".join(options), dt, recurrence)
+        "INSERT INTO polls (chat_id, question, options, schedule_time, recurrence, recurrence_detail) VALUES (?, ?, ?, ?, ?, ?)",
+        (chat_id, question, ",".join(options), dt, recurrence, recurrence_detail)
     )
     conn.commit()
     poll_id = cur.lastrowid
@@ -249,23 +329,23 @@ async def ricevi_ricorrenza(update: Update, context: ContextTypes.DEFAULT_TYPE):
         run_async_job,
         'date',
         run_date=datetime.strptime(dt, "%Y-%m-%d %H:%M"),
-        args=(pubblica_sondaggio(chat_id, question, options, application, poll_id, recurrence),)
+        args=(pubblica_sondaggio(chat_id, question, options, application, poll_id, recurrence, recurrence_detail),)
     )
     city = get_city_for_chat(chat_id)
     await update.message.reply_text(
         f"Sondaggio programmato per il {local_dt} ({city}) "
-        f"(UTC: {dt}) con ricorrenza: {recurrence}.\n"
+        f"(UTC: {dt}) con ricorrenza: {recurrence if recurrence != 'nessuna' else 'nessuna'}.\n"
         f"ATTENZIONE: il bot deve essere amministratore del gruppo e poter inviare sondaggi!"
     )
-    print(f"--- SCHEDULATO sondaggio per chat_id={chat_id} | Domanda: {question} | Opzioni: {options} | Data(UTC): {dt} | Ricorrenza: {recurrence}", flush=True)
-    logger.info(f"Sondaggio schedulato per chat_id={chat_id} | Domanda: {question} | Opzioni: {options} | Data: {dt} | Ricorrenza: {recurrence}")
+    print(f"--- SCHEDULATO sondaggio per chat_id={chat_id} | Domanda: {question} | Opzioni: {options} | Data(UTC): {dt} | Ricorrenza: {recurrence} | Dettaglio: {recurrence_detail}", flush=True)
+    logger.info(f"Sondaggio schedulato per chat_id={chat_id} | Domanda: {question} | Opzioni: {options} | Data: {dt} | Ricorrenza: {recurrence} | Dettaglio: {recurrence_detail}")
     return ConversationHandler.END
 
 async def annulla(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Operazione annullata.")
     return ConversationHandler.END
 
-async def pubblica_sondaggio(chat_id, question, options, application, poll_id, recurrence):
+async def pubblica_sondaggio(chat_id, question, options, application, poll_id, recurrence, recurrence_detail):
     print(f"--- PUBBLICAZIONE: provo a inviare sondaggio a chat_id={chat_id} alle {datetime.utcnow()}", flush=True)
     try:
         logger.info(f"Tentativo invio sondaggio a chat_id={chat_id} | Domanda: {question} | Opzioni: {options}")
@@ -277,12 +357,30 @@ async def pubblica_sondaggio(chat_id, question, options, application, poll_id, r
         )
         print(f"--- INVIATO sondaggio per chat_id={chat_id} a {datetime.utcnow()}", flush=True)
         logger.info(f"Sondaggio pubblicato per chat_id={chat_id} con successo!")
+        next_time = None
         if recurrence == "giornaliera":
-            next_time = datetime.utcnow() + timedelta(days=1)
+            # estrai orario da recurrence_detail
+            _, hourmin = recurrence_detail.split("|")
+            hour, minute = map(int, hourmin.split("."))
+            tz_str = get_timezone_for_chat(chat_id)
+            tz = pytz.timezone(tz_str)
+            now_local = datetime.utcnow().astimezone(tz)
+            candidate = now_local + timedelta(days=1)
+            candidate = candidate.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            next_time = candidate.astimezone(pytz.utc)
         elif recurrence == "settimanale":
-            next_time = datetime.utcnow() + timedelta(weeks=1)
-        else:
-            next_time = None
+            _, wd, hourmin = recurrence_detail.split("|")
+            wd = int(wd)
+            hour, minute = map(int, hourmin.split("."))
+            tz_str = get_timezone_for_chat(chat_id)
+            tz = pytz.timezone(tz_str)
+            now_local = datetime.utcnow().astimezone(tz)
+            days_ahead = (wd - now_local.weekday() + 7) % 7
+            candidate = now_local + timedelta(days=days_ahead)
+            candidate = candidate.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if candidate <= now_local:
+                candidate += timedelta(weeks=1)
+            next_time = candidate.astimezone(pytz.utc)
         if next_time:
             cur.execute(
                 "UPDATE polls SET schedule_time = ? WHERE id = ?",
@@ -293,7 +391,7 @@ async def pubblica_sondaggio(chat_id, question, options, application, poll_id, r
                 run_async_job,
                 'date',
                 run_date=next_time,
-                args=(pubblica_sondaggio(chat_id, question, options, application, poll_id, recurrence),)
+                args=(pubblica_sondaggio(chat_id, question, options, application, poll_id, recurrence, recurrence_detail),)
             )
         else:
             cur.execute("DELETE FROM polls WHERE id = ?", (poll_id,))
@@ -304,22 +402,22 @@ async def pubblica_sondaggio(chat_id, question, options, application, poll_id, r
         traceback.print_exc()
 
 def carica_sondaggi_precedenti(application):
-    cur.execute("SELECT id, chat_id, question, options, schedule_time, recurrence FROM polls")
+    cur.execute("SELECT id, chat_id, question, options, schedule_time, recurrence, recurrence_detail FROM polls")
     for poll in cur.fetchall():
-        poll_id, chat_id, question, options, schedule_time, recurrence = poll
+        poll_id, chat_id, question, options, schedule_time, recurrence, recurrence_detail = poll
         dt = datetime.strptime(schedule_time, "%Y-%m-%d %H:%M")
         if dt > datetime.utcnow():
             scheduler.add_job(
                 run_async_job,
                 'date',
                 run_date=dt,
-                args=(pubblica_sondaggio(chat_id, question, options.split(','), application, poll_id, recurrence),)
+                args=(pubblica_sondaggio(chat_id, question, options.split(','), application, poll_id, recurrence, recurrence_detail),)
             )
-            print(f"--- RIPRISTINATO sondaggio per chat_id={chat_id} | Domanda: {question} | Data: {schedule_time} | Ricorrenza: {recurrence}", flush=True)
-            logger.info(f"Sondaggio ripristinato per chat_id={chat_id} | Domanda: {question} | Data: {schedule_time} | Ricorrenza: {recurrence}")
+            print(f"--- RIPRISTINATO sondaggio per chat_id={chat_id} | Domanda: {question} | Data: {schedule_time} | Ricorrenza: {recurrence} | Dettaglio: {recurrence_detail}", flush=True)
+            logger.info(f"Sondaggio ripristinato per chat_id={chat_id} | Domanda: {question} | Data: {schedule_time} | Ricorrenza: {recurrence} | Dettaglio: {recurrence_detail}")
 
 if __name__ == "__main__":
-    print("Sto avviando il BOT! Versione città/fuso orario auto con log pubblicazione!", flush=True)
+    print("Sto avviando il BOT! Versione con scelta ricorrenza avanzata!", flush=True)
 
     if not TOKEN:
         print("Errore: TOKEN non impostato. Devi configurare la variabile d'ambiente TELEGRAM_BOT_TOKEN.", flush=True)
@@ -334,7 +432,8 @@ if __name__ == "__main__":
             QUESTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_domanda)],
             OPTIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_opzioni)],
             DATETIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_data)],
-            RECURRENCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_ricorrenza)],
+            ASK_RECURRENCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_ask_ricorrenza)],
+            RECURRENCE_DETAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, ricevi_recurrence_detail)],
         },
         fallbacks=[CommandHandler('annulla', annulla)],
     )
